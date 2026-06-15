@@ -122,7 +122,7 @@ Several highly ranked genes, including CEP55, EXO1, and CCNB1, have previously b
 
 ---
 
-## Technologies
+## Tools & Methods
 
 ### Programming
 
@@ -180,9 +180,9 @@ luad-multiomics-classification/
 
 ---
 
-## Analysis Workflow
+## Notebooks
 
-The notebooks are intended to be executed sequentially.
+The analysis is organized into four sequential R Markdown notebooks:
 
 ### 01 Data Preprocessing and Integration
 
@@ -200,7 +200,7 @@ The notebooks are intended to be executed sequentially.
 - Random Forest training
 - Support Vector Machine training
 
-### 03 Model Evaluation
+### 03 Model Testing and Evaluation
 
 - Evaluate models on independent test data
 - Generate confusion matrices
