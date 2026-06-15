@@ -1,15 +1,44 @@
 ---
-title: "2: TCGA LUAD Data Modeling"
+
+title: "LUAD Multi-Omics Classification: Feature Selection and Model Training"
 output:
-  html_document:
-    df_print: paged
----
+html_document:
+df_print: paged
+---------------
 
-# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+# Feature Selection and Model Training
 
-**Silvia Cambiago\
-Sofiia Hoian\
-Ana Belen Solis Pinson**
+## Project Overview
+
+This notebook performs differential expression and differential methylation analyses to identify biologically relevant features associated with LUAD molecular subtypes.
+
+Selected features are integrated into machine learning workflows for subtype classification.
+
+## Pipeline Position
+
+Step 2 of 4
+
+Data Acquisition → Data Integration → Feature Selection & Modeling → Evaluation → Biological Interpretation
+
+## Methods
+
+* Differential Expression Analysis (DESeq2)
+* Differential Methylation Analysis (limma)
+* Multi-omics feature integration
+* Random Forest classification
+* Support Vector Machine classification
+
+## Outputs
+
+* Significant DEGs
+* Significant DMPs
+* Integrated feature matrices
+* Trained machine learning models
+
+## Authors
+
+Developed as part of a collaborative academic project at Freie Universität Berlin.
+
 
 # Section 2: Data Modeling
 
