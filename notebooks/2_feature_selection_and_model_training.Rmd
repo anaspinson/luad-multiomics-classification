@@ -1,0 +1,1918 @@
+---
+title: "2: TCGA LUAD Data Modeling"
+output:
+  html_document:
+    df_print: paged
+---
+
+# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+
+## Data Science in the Life Sciences S25 - Final Project
+
+### Group 5
+
+**Silvia Cambiago\
+Sofiia Hoian\
+Ana Belen Solis Pinson**
+
+# Section 2: Data Modeling
+
+Our final project focused on working with the TCGA LUAD (Lung Adenocarcinoma) RNA-Seq, Methylation and Clinical data. This R Notebook contains the code corresponding to the Data Modeling, step 3 of the omics data analysis cycle, including the following sections:
+
+3.  **Data Modeling**
+
+    a\. Differential Gene Expression Analysis - Pairwise Comparisons
+
+    b\. Differential Methylation Analysis - Pairwise Comparisons
+
+    c\. Feature Selection - Intersecting genes from DEGs and DMP Results
+
+    d\. Feature Matrices Generation for Machine Learning Classification - Subtype & Stage
+
+    e\. Machine Learning Model Training, Tuning & Evaluation - RF & SVM
+
+# 2.1 Setup
+
+Load required libraries.
+
+```{r setup, message=FALSE, warning=FALSE}
+
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install Bioconductor only if not already installed
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+
+# Bioconductor Packages
+#BiocManager::install(c("recount3", "SummarizedExperiment", "DESeq2", "TCGAutils", "TCGAbiolinks", "curatedTCGAData", "sesame", "sesameData", "org.Hs.eg.db"))
+
+# CRAN Packages
+#install.packages("tidyverse", "caret", "dplyr", "pheatmap", "tibble", "ggplot2", "reshape2", "pROC")
+
+# Load libraries
+library(recount3) #RNA-Seq data
+library(SummarizedExperiment) #RNA-seq data manipulation
+library(tidyverse) # Data Manipulation
+library(DESeq2) #DEG
+library(caret) # Stratification
+library(dplyr) # Stratification
+library(curatedTCGAData) #Cancer subtypes and stage
+library(TCGAbiolinks) # Methylation data
+library(sesame) #Methylation
+library(sesameData) #Methylation
+library(org.Hs.eg.db) #Map to HGNC gene symbols
+library(randomForest)
+library(pROC)
+library(e1071)
+library(readr)
+
+# Visualization
+library(pheatmap)
+library(tibble)
+library(ggplot2)
+library(reshape2)
+library(VennDiagram)
+library(grid)
+
+```
+
+Set working directory. Intermediate objects will be saved in and loaded from folders created in this working location.
+
+```{r work-dir-setup}
+
+work_dir <- "/home/rstudio/data/FinalProject/LUAD Project RData/Final_Code/"
+
+# Set working directory
+setwd(work_dir)
+
+```
+
+# 2.2 Differential Gene Expression Analysis
+
+## 2.2.1 Set up input data and parameters
+
+*DESeq2* Differential Gene Expression analysis will be run in a pairwise manner.
+
+```{r input-param, message=FALSE, warning=FALSE}
+
+# Note: path/file names shoud be change based on comparison pair
+
+rdata_path <- "rse_prad_2etv1_vs_5spop.RData"     # path to the .RData file containing the SummarizedExperiment object
+rse_object_name <- "rse_prad_2etv1_vs_5spop"      # name of the object to load from the RData file
+
+group_var <- "expression_subtype"                # column in colData used to define experimental groups
+
+condition_1 <- "2-ETV1"                          # first condition (will be used as numerator in log2FC)
+condition_2 <- "5-SPOP"                          # second condition (will be used as denominator in log2FC)
+
+```
+
+## 2.2.2 Set up output directories
+
+```{r out-dir-setup, message=FALSE, warning=FALSE}
+
+#Output base directory
+out_dir <- "/Users/mac/Desktop/data_science_project"
+
+# Preparing folder and file naming
+file_base <- tools::file_path_sans_ext(basename(rdata_path))
+prefix <- sub("^rse_", "", file_base)
+comparison_label <- paste0(condition_1, "_vs_", condition_2)
+comparison_label_safe <- gsub("[^A-Za-z0-9_\\-]", "_", comparison_label)
+
+# Creating sub-directory for saving results
+sub_dir <- file.path(out_dir, prefix)
+if (!dir.exists(sub_dir)) dir.create(sub_dir, recursive = TRUE)
+
+```
+
+## 2.2.3 Differential Expression Analysis
+
+```{r dseq2-analysis, message=FALSE, warning=FALSE}
+
+#Load the RData object
+load(rdata_path)
+
+# Ensure the object exists
+if (!(rse_object_name %in% ls())) {
+  stop(paste("Object", rse_object_name, "not found in loaded environment"))
+}
+
+rse <- base::get(rse_object_name)
+
+# Filter samples with non-NA group labels
+coldata <- colData(rse)
+valid_samples <- !is.na(coldata[[group_var]])
+rse_filtered <- rse[, valid_samples]
+
+# Run DESeq2 analysis
+dds <- DESeqDataSetFromMatrix(
+  countData = assays(rse_filtered)$raw_counts,
+  colData = colData(rse_filtered),
+  design = as.formula(paste("~", group_var))
+)
+dds <- DESeq(dds)
+
+# Get results for the desired contrast
+res <- results(dds, contrast = c(group_var, condition_1, condition_2), alpha = 0.05)
+res_df <- as.data.frame(res)
+res_df <- res_df[complete.cases(res_df[, c("padj", "log2FoldChange")]), ]
+
+# Filter significant DEGs
+# We define significant differentially expressed genes (DEGs) using the following thresholds:
+# - Adjusted p-value (padj) < 0.05: controls for multiple testing (FDR < 5%)
+# - Absolute log2 fold change (|log2FC|) ≥ 1: corresponds to at least 2-fold up/down regulation
+
+deg_df <- res_df[which(res_df$padj < 0.05 & abs(res_df$log2FoldChange) >= 1), ]
+deg_df$gene <- rownames(deg_df) # Add gene names as a separate column (they are currently row names)
+deg_df <- deg_df[order(deg_df$padj), ] # Sort the DEGs by adjusted p-value in ascending order (most significant genes first)
+
+# Normalize counts
+# Getting normalized counts using DESeq2's size factor normalization
+# These values are useful for visualization
+
+norm_counts <- counts(dds, normalized = TRUE)
+
+# Apply variance stabilizing transformation (VST) to the count data
+vsd <- varianceStabilizingTransformation(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+
+# Extract sample metadata as a plain data frame (for annotation)
+metadata_df <- as.data.frame(colData(dds))
+
+# Save outputs
+saveRDS(dds, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_dds_processed.rds")))
+saveRDS(res, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_deseq2_results_full.rds")))
+saveRDS(vsd, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_vsd_object.rds")))
+
+write.csv(res_df, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_deseq2_results_full.csv")), row.names = TRUE)
+write.csv(deg_df, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_DEG_filtered.csv")), row.names = FALSE)
+write.csv(norm_counts, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_normalized_counts.csv")))
+write.csv(vsd_mat, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_vsd_log_normalized_counts.csv")))
+write.csv(metadata_df, file = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_sample_metadata.csv")))
+
+```
+
+## 2.2.4 Results Visualisation
+
+MA, Volcano and Heatmap plots.
+
+```{r visualization, message=FALSE, warning=FALSE}
+
+# MA Plot
+png(filename = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_MA_plot.png")), width = 900, height = 600, res = 120)
+plotMA(res, ylim = c(-5, 5), main = paste(prefix, comparison_label, ":", "MA Plot"))
+dev.off()
+
+# Volcano Plot
+res_df$threshold <- as.factor(abs(res_df$log2FoldChange) > 1 & res_df$padj < 0.05)
+volcano_plot <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_minimal() +
+  labs(x = "log2 Fold Change", y = "-log10(adjusted p-value)",
+       title = paste(prefix, comparison_label, ":", "Volcano Plot")) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+ggsave(filename = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_Volcano_plot.png")),
+       plot = volcano_plot, width = 7, height = 6, dpi = 120)
+
+# Heatmap of Top 30 DEGs
+top_genes <- head(rownames(deg_df), 30)
+heatmap_data <- norm_counts[top_genes, ]
+heatmap_data <- t(scale(t(heatmap_data)))
+
+annotation_col <- metadata_df[, group_var, drop = FALSE]
+colnames(annotation_col) <- "Group"
+
+png(filename = file.path(sub_dir, paste0(prefix, "_", comparison_label_safe, "_Heatmap_top30_genes.png")), width = 1000, height = 700, res = 120)
+pheatmap(heatmap_data,
+         annotation_col = annotation_col,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         fontsize_row = 8,
+         main = paste(prefix, comparison_label, ":", "Top 30 DEGs Heatmap"))
+dev.off()
+
+```
+
+# 2.3 Differential Methylation Analysis
+
+Pairwise differential methylation analysis between stages and subtypes. \
+**Note:** some pre-processing steps are rerun to produce contrast matrices for *limma*.
+
+```{r met-data-load}
+
+# Load the saved object (so future knits skip the heavy prepare)
+load(file.path(download_dir, "LUAD_methylation_SE.rda"))  # gives `luad_met`
+
+# Filter out MASK_general == TRUE probes, as these are bad quality
+luad_met_filtered <- luad_met[!rowData(luad_met)$MASK_general %in% TRUE, ]
+
+```
+
+```{r met-data-processing}
+
+# Extract β-matrix and metadata
+beta_mat  <- assay(luad_met_filtered)
+meta_meth <- as.data.frame(colData(luad_met_filtered))
+
+# Subset to RNA‐seq samples only
+rse_train <- rse_luad_sgc_filtered[, colData(rse_luad_sgc_filtered)$split == "train"] #493 train samples from RNA-seq
+rna_ids   <- substr(colData(rse_train)$tcga.cgc_sample_id, 1, 16)
+meth_ids  <- substr(colnames(beta_mat), 1, 16)
+common <- intersect(rna_ids, meth_ids) # 392 common samples between meth and RNA-seq
+
+# Select only common samples of type primary tumor
+primary_tumor_met_samples <- meta_meth$sample[meta_meth$sample_type == "Primary Tumor"] 
+
+# Intersect RNA-matched methylation samples with primary tumors only
+common_primary <- intersect(common, primary_tumor_met_samples) 
+
+# Align and subset the β‐matrix with only common primary tumor samples
+idx_beta <- match(common_primary, meth_ids)
+beta_sub <- beta_mat[, idx_beta]
+
+# Filter RNA-seq rse_train to keep only matching primary tumor samples
+rna_ids_primary <- match(common_primary, rse_train$tcga.cgc_sample_id)
+rse_train_primary <- rse_train[, rna_ids_primary]
+
+# Convert beta values to M-values once for both stage and subtype comparisons
+percentM <- beta_sub * 100
+percentM <- pmin(pmax(percentM, 0.01), 99.99)  # clamp to avoid ±Inf
+Mval <- log2(percentM / (100 - percentM)) 
+
+# Build the stage factor in the same order
+stages_train <- factor(
+  rse_train_primary$stage_collapsed[match(common_primary, rse_train_primary$tcga.cgc_sample_id)],
+  levels = c("Stage_I", "Stage_II", "Stage_III", "Stage_IV")
+)
+
+# Subtype factor in the same order
+subtypes_train <- factor(
+  rse_train_primary$expression_subtype[match(common_primary, rse_train_primary$tcga.cgc_sample_id)],
+  levels = c("prox.-inflam", "prox.-prolif.", "TRU"),
+  labels = c("prox_inflam", "prox_prolif", "TRU") # for readability
+)
+
+# Subtype NA filtering
+keep_subtype <- !is.na(subtypes_train)
+Mval_subtype <- Mval[, keep_subtype]
+subtypes_train_filtered <- subtypes_train[keep_subtype]
+
+# Stage NA filtering
+keep_stage <- !is.na(stages_train)
+Mval_stage <- Mval[, keep_stage]
+stages_train_filtered <- stages_train[keep_stage]
+
+```
+
+*limma* contrast matrices creation to specify pairwise comparisons for subtype and stage.
+
+```{r subtype-limma-contrast-matrix, message=FALSE}
+
+# Set up limma design & contrasts
+
+# Subtype
+# Design matrix, no intercept
+design_subtype <- model.matrix(~ 0 + subtypes_train_filtered)
+colnames(design_subtype) <- levels(subtypes_train_filtered)
+
+# Pairwise subtype comparisons, using only the filtered primary tumor samples
+contMat_subtype <- makeContrasts(
+  proxProlif_vs_proxInflam = prox_prolif - prox_inflam,
+  TRU_vs_proxInflam        = TRU         - prox_inflam,
+  TRU_vs_proxProlif        = TRU         - prox_prolif,
+  levels = design_subtype
+)
+
+# Fit model
+fit_subtype <- lmFit(Mval_subtype, design_subtype)
+fit_subtype <- contrasts.fit(fit_subtype, contMat_subtype)
+fit_subtype <- eBayes(fit_subtype) 
+
+```
+
+```{r stage-limma-contrast-matrix, message=FALSE}
+
+# Stage
+
+# Design matrix, no intercept
+design_stage <- model.matrix(~ 0 + stages_train_filtered)
+colnames(design_stage) <- levels(stages_train_filtered)
+
+# Subtype pairwise comparisons
+contMat_stage <- makeContrasts(
+  II_vs_I   = Stage_II   - Stage_I,
+  III_vs_I  = Stage_III  - Stage_I,
+  IV_vs_I   = Stage_IV   - Stage_I,
+  III_vs_II = Stage_III  - Stage_II,
+  IV_vs_II  = Stage_IV   - Stage_II,
+  IV_vs_III = Stage_IV   - Stage_III,
+  levels = design_stage
+)
+
+# Fit model
+fit_stage <- lmFit(Mval_stage, design_stage)
+fit_stage <- contrasts.fit(fit_stage, contMat_stage)
+fit_stage <- eBayes(fit_stage)
+
+```
+
+Extract differentially methylated probes (DMPs) from each comparison.
+
+```{r dm-extraction}
+
+# Extract DMPs for each contrast and save
+
+# Create gene annotation vector using luad_met metadata
+gene_annot_vector <- rowData(luad_met_filtered)$gene_HGNC #421433, corresponds to genes mapped to probes
+names(gene_annot_vector) <- rownames(luad_met_filtered)
+
+# Helper function to extract and save dmp results
+save_dmp_results <- function(fit_obj, contMat, outdir_prefix, gene_annot_vector) {
+  if (!dir.exists(outdir_prefix)) dir.create(outdir_prefix)
+  
+  for (coef in colnames(contMat)) {
+    dmp <- topTable(fit_obj, coef = coef, number = Inf, adjust.method = "fdr")
+    
+    # Add gene_HGNC annotation
+    dmp$gene_HGNC <- gene_annot_vector[rownames(dmp)]
+    
+    # Split probes that map to multiple genes
+    dmp_expanded <- dmp |>
+      tibble::rownames_to_column("probe_id") |>
+      tidyr::separate_rows(gene_HGNC, sep = ";") |>
+      dplyr::filter(!is.na(gene_HGNC) & gene_HGNC != "")
+    
+    # Save as .csv and .rds
+    write.csv(dmp_expanded,
+              file = file.path(outdir_prefix, paste0("DMP_", coef, ".csv")),
+              row.names = FALSE)
+    
+    saveRDS(dmp_expanded,
+            file = file.path(outdir_prefix, paste0("DMP_", coef, ".rds")))
+  }
+}
+
+# Using the function to produce and save subtype and stage results
+save_dmp_results(fit_subtype, contMat_subtype, "LUAD_methylation_limma_subtype_results", gene_annot_vector)
+save_dmp_results(fit_stage, contMat_stage, "LUAD_methylation_limma_stage_results", gene_annot_vector) 
+
+```
+
+# 2.4 Feature Selection
+
+Intersection of differentially methylated probes and differentially expressed genes resulting from *DESeq2* and *limma* runs.
+
+```{r gene-intersection-prep}
+
+# Ensembl to symbol mapping function
+ensembl_to_symbol <- function(ensembl_ids) {
+  ids_noversion <- sub("\\..*$", "", ensembl_ids)
+  map <- AnnotationDbi::select(org.Hs.eg.db,
+                               keys = ids_noversion,
+                               keytype = "ENSEMBL",
+                               columns = c("SYMBOL"))
+  map <- map[!is.na(map$SYMBOL), ]
+  symbol_vec <- map$SYMBOL
+  names(symbol_vec) <- map$ENSEMBL
+  unique(symbol_vec[ids_noversion])
+}
+
+# Location of DEGs and DMPs
+de_dir <- "Differential expression"
+meth_subtype_dir <- "Differential Methylation Cluster Results/LUAD_methylation_limma_subtype_results"
+meth_stage_dir   <- "Differential Methylation Cluster Results/LUAD_methylation_limma_stage_results"
+outdir <- "LUAD_intersections"
+if (!dir.exists(outdir)) dir.create(outdir)
+
+```
+
+```{r deg-dmp-files-processing}
+
+# Find all DEG and DMP .csv files 
+de_files <- list.files(de_dir, pattern = "\\.csv$", full.names = TRUE)
+meth_files <- c(
+  list.files(meth_stage_dir, pattern = "\\.csv$", full.names = TRUE),
+  list.files(meth_subtype_dir, pattern = "\\.csv$", full.names = TRUE)
+)
+
+# Helper function: extract comparison name
+get_comp <- function(path) {
+  name <- tools::file_path_sans_ext(basename(path))
+  sub("^DMP_", "", name)  # Remove "DMP_" from start if present to match DE files
+}
+
+```
+
+Intersect significantly expressed and methylated genes.
+
+```{r get-sig-results}
+get_sig_degs <- function(de_path, fdr_col = "padj", gene_col = "gene", threshold = 0.05) {
+  dat <- read_csv(de_path, show_col_types = FALSE)
+  dat %>% filter(!is.na(!!sym(fdr_col)), !!sym(fdr_col) < threshold) %>%
+    pull(!!sym(gene_col)) %>% unique()
+}
+
+get_sig_dmps <- function(meth_path, fdr_col = "adj.P.Val", gene_col = "gene_HGNC", threshold = 0.05) {
+  dat <- read_csv(meth_path, show_col_types = FALSE)
+  # flatten out comma-separated symbols 
+  sig_genes <- dat %>%
+    filter(!is.na(!!sym(fdr_col)), !!sym(fdr_col) < threshold,
+           !is.na(!!sym(gene_col)), !!sym(gene_col) != "") %>%
+    pull(!!sym(gene_col)) %>%
+    str_split(",") %>% unlist() %>% str_trim() %>% unique()
+  sig_genes[sig_genes != ""]
+}
+```
+
+Loop over all comparisons: produce intersection files.
+
+```{r intersection-file-generation}
+
+# Create tibbles for easy joining by comp name
+de_tbl <- tibble(de_path = de_files, comp = get_comp(de_files))
+meth_tbl <- tibble(meth_path = meth_files, comp = get_comp(meth_files))
+
+# Define which comparison names are stages
+stage_names <- c("II_vs_I", "III_vs_I", "IV_vs_I", "III_vs_II", "IV_vs_II", "IV_vs_III")
+
+# Initialize lists for union tracking
+intersect_union_subtypes <- list()
+intersect_union_stages <- list()
+
+for(i in seq_len(nrow(de_tbl))) {
+  comp <- de_tbl$comp[i]
+  de_path <- de_tbl$de_path[i]
+  
+  # Try to find meth file with exactly the same comp name
+  meth_match <- filter(meth_tbl, comp == !!comp)
+  if(nrow(meth_match) == 0) {
+    cat("No methylation CSV for:", comp, "<br>\n")
+    next
+  }
+  meth_path <- meth_match$meth_path[1]
+
+  degs <- get_sig_degs(de_path)
+  degs_symbols <- toupper(ensembl_to_symbol(degs))
+  dmps <- toupper(get_sig_dmps(meth_path))
+  intersection <- intersect(degs_symbols, dmps)
+  
+  # Determine if this is a stage or subtype comparison for union
+  if (comp %in% stage_names) {
+    intersect_union_stages[[comp]] <- intersection
+  } else {
+    intersect_union_subtypes[[comp]] <- intersection
+  }
+
+  # Output summary
+  cat("###", comp, "<br>\n")
+  cat("- Significant DEGs:", length(degs), "<br>\n")
+  cat("- Significant DMPs:", length(dmps), "<br>\n")
+  cat("- Genes in both:", length(intersection), "<br>\n")
+  if(length(intersection) > 0) print(knitr::kable(head(intersection, 10), col.names = "Intersected Genes"))
+
+  # Venn Diagrams
+  grid.newpage()
+  draw.pairwise.venn(
+    area1 = length(degs), area2 = length(dmps), cross.area = length(intersection),
+    category = c("DEGs", "DMPs"), fill = c("red", "blue"),
+    main = paste("Overlap in", comp)
+  )
+  # Save
+  safe_comp <- gsub("[^a-zA-Z0-9]", "_", comp)
+  write_csv(data.frame(Gene = intersection),
+            file = file.path(outdir, paste0("Intersection_", safe_comp, ".csv")))
+}
+
+# Save union of intersected genes for multiclass classifiers
+union_subtype_genes <- unique(unlist(intersect_union_subtypes))
+union_stage_genes   <- unique(unlist(intersect_union_stages))
+
+write_csv(tibble(Gene = union_subtype_genes), file = file.path(outdir, "Union_Subtype_Intersected_Genes.csv"))
+write_csv(tibble(Gene = union_stage_genes),   file = file.path(outdir, "Union_Stage_Intersected_Genes.csv"))
+
+```
+
+# 2.5 Feature Matrices Generation
+
+For feature matrix generation, first a global matrix integrating methylation and expression values will be created and scaled. Then, we will create feature matrices to serve as input for our binary classification and multi-class classifiers, using features found in the feature selection step for each pairwise comparison. After intersection, only subtype comparisons were kept in the analysis, as no DEG and DMP intersecting genes were found for the stage comparisons.
+
+## 2.5.1 Data Normalization & Processing
+
+Differential gene expression was done on raw counts, methylation data was transformed into M values. For model training, expression counts will be normalized with *DESEq2::vst* function, and M values will be used for methylation data.
+
+### RNA-Seq Data Processing
+
+```{r rna-fm-object-load}
+
+# Load objects from previous processing steps that are needed for feature matrix generation
+
+# rse_train_primary, contains primary tumor training samples
+# common_primary, list of common samples between RNA-sequences & methylation data
+# Specify folder where RSE file is
+rse_dir <- "LUAD_rse_objects"
+
+# Construct full relative path
+rse_path <- file.path(rse_dir, "rse_train_primary.RData")
+common_primary_path <- file.path(rse_dir, "common_primary.RData")
+
+# Load the saved object
+load(rse_path)
+load(common_primary_path)
+
+```
+
+Create a normalized data expression matrix with samples as column names.
+
+```{r rna-data-norm, message=FALSE}
+
+# Build subtype factors from rse_train_primary (if not available from differential methylation)
+subtypes_train <- factor(
+  rse_train_primary$expression_subtype[match(common_primary, rse_train_primary$tcga.cgc_sample_id)],
+  levels = c("prox.-inflam", "prox.-prolif.", "TRU"),
+  labels = c("prox_inflam", "prox_prolif", "TRU") # for readability
+)
+
+# Subtype NA filtering
+keep_subtype <- !is.na(subtypes_train)
+Mval_subtype <- Mval[, keep_subtype] 
+subtypes_train_filtered <- subtypes_train[keep_subtype]
+
+# Subset rse_train_primary to only contain samples with subtype
+short_ids <- stringr::str_sub(rse_train_primary$tcga.cgc_sample_id, 1, 12)
+rse_train_primary$short_id <- short_ids
+keep_samples <- short_ids %in% names(subtypes_train_filtered)
+rse_train_subtyped <- rse_train_primary[, keep_samples]
+
+# Expression counts: Normalization using DESeq2::vst
+raw_counts <- assays(rse_train_subtyped)$raw_counts
+
+vst_obj <- vst(DESeqDataSetFromMatrix(
+  countData = raw_counts,
+  colData   = colData(rse_train_subtyped),
+  design    = ~ 1
+))
+
+```
+
+Create RNA-Seq normalized expression data matrix.
+
+```{r rna-exp-matrix}
+
+# Create normalized counts expression matrix, rows = genes, cols = samples
+expr_mat <- assay(vst_obj)  # vst-normalized expression
+
+# Assign TCGA sample ids as colnames for expr_mat
+colnames(expr_mat) <- rse_train_subtyped$tcga.cgc_sample_id
+
+```
+
+### Ensemble IDs to HGNC Gene symbol mapping
+
+RNA-Seq has ENSEMBLE gene IDs, they will be mapped to HGNC gene symbols.\
+Multiple ENSEMBL IDs map to a single HGNC gene symbol, for our feature matrix, a single expression value will be present per gene, so records mapping to the same gene will be averaged to get a single expression value per gene.
+
+```{r ensembl-to-symbol}
+
+# ensembl_to_symbol function: convert RNA-seq gene Ensemble ids to HGNC,returns a named vector with mappings, (not unique genes as done for intersection)
+
+ensembl_to_symbol <- function(ensembl_ids) {
+  ids_noversion <- sub("\\..*$", "", ensembl_ids)
+  
+  map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = unique(ids_noversion),
+    keytype = "ENSEMBL",
+    columns = "SYMBOL"
+  )
+  
+  map <- map[!is.na(map$SYMBOL) & map$SYMBOL != "", ]
+  map <- map[!duplicated(map$ENSEMBL), ]
+
+  # Named vector: names = Ensembl, values = SYMBOL
+  hgnc_vec <- setNames(map$SYMBOL, map$ENSEMBL)
+
+  # Return in input order
+  return(hgnc_vec[ids_noversion])
+}
+
+```
+
+```{r rna-gene-symbol-map, message=FALSE}
+
+# Remove version from ID
+ensembl_ids <- gsub("\\..*", "", rownames(expr_mat))  # Remove version
+hgnc_names <- ensembl_to_symbol(ensembl_ids)
+gene_symbols <- hgnc_names[ensembl_ids]
+
+# Add gene symbols as a column to a df before assigning as rownames
+expr_df <- as.data.frame(expr_mat)
+expr_df$gene_symbol <- gene_symbols
+
+# Move gene_symbol to the first column
+expr_df <- expr_df[, c(ncol(expr_df), 1:(ncol(expr_df) - 1))]
+
+#Convert to tibble
+expr_df <- as_tibble(expr_df)
+
+# Filter NA gene symbols and aggregate duplicated gene expression values
+expr_df <- expr_df %>%
+  filter(!is.na(gene_symbol) & gene_symbol != "")
+
+# Average duplicates
+expr_avg <- expr_df %>%
+  group_by(gene_symbol) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+# Replace expr_mat with expr_avg to use downstream as matrix again
+expr_mat <- expr_avg %>%
+  column_to_rownames("gene_symbol") %>%
+  as.matrix()
+
+```
+
+### Methylation Data Processing
+
+```{r met-fm-object-load}
+
+# Load objects from previous processing steps needed for feature matrix generation
+
+# Specify folder where luad_met_filtered file is
+luad_met_filtered_dir <- "LUAD_met_data_files"
+
+# Construct full relative path
+luad_met_filtered_path <- file.path(luad_met_filtered_dir, "luad_met_filtered.RData")
+
+# Load the saved SummarizedExperiment object
+load(luad_met_filtered_path)
+
+```
+
+```{r met-fm-object-creation}
+
+# Create gene annotation vector using luad_met metadata
+gene_annot_vector <- rowData(luad_met_filtered)$gene_HGNC
+names(gene_annot_vector) <- rownames(luad_met_filtered)
+
+# Recode of subtype names in subtypes_train_filtered
+subtypes_train_filtered <- recode(subtypes_train_filtered,
+  "prox_prolif" = "proxProlif",
+  "prox_inflam" = "proxInflam"
+)
+
+```
+
+Collapsing multiple CpG probes that map to one gene, one methylation value per gene will be kept.
+
+```{r met-annot-tbl}
+
+# annot_tbl, one probe per row mapped to corresponding gene
+# probes mapping to more than one gene get their own row
+annot_tbl <- tibble(
+  probe = names(gene_annot_vector),
+  gene  = gene_annot_vector
+) %>%
+  separate_rows(gene, sep = ";") %>%
+  filter(!is.na(gene) & gene != "") %>%
+  filter(probe %in% rownames(Mval_subtype))
+
+```
+
+```{r met-probe-collapse}
+
+# mval_long, get gene level M values
+mval_long <- Mval_subtype[annot_tbl$probe, , drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("probe") %>%
+  left_join(annot_tbl, by = "probe") %>%
+  filter(!is.na(gene) & gene != "") %>%
+  pivot_longer(-c(probe, gene), names_to = "sample", values_to = "mval") %>%
+  group_by(gene, sample) %>%
+  summarise(meth = mean(mval, na.rm = TRUE), .groups = "drop")
+
+```
+
+Methylation M values matrix creation.
+
+```{r met-mval-matrix}
+
+# Methylation values matrix, rows = genes, columns = samples
+meth_mat <- mval_long %>%
+  pivot_wider(names_from = sample, values_from = meth) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# Shortening sample names to match expression matrix
+colnames(meth_mat) <- substr(colnames(meth_mat), 1, 16)
+
+```
+
+### Gene Intersection between expr_math and meth_mat
+
+Create a set of genes present in both methylation and RNA-seq data, necessary to generate a combined expression + methylation feature matrix.
+
+```{r exp-met-mat-gene-intersect}
+
+# Intersect genes present in both omics, to create a joint matrix
+common_genes <- intersect(rownames(expr_mat), rownames(meth_mat)) 
+
+expr_mat_sub <- expr_mat[common_genes, ]
+meth_mat_sub <- meth_mat[common_genes, ]
+
+expr_mat <- expr_mat_sub
+meth_mat <- meth_mat_sub
+
+cat("Common genes between methylation and expression data:", length(common_genes))
+```
+
+### Global Feature Matrix Scaling
+
+The expression and methylation matrices will be combined to get a multi-omics matrix, which will be scaled. This scaled combined matrix will serve as the starting point to subset the features selected during the Feature selection step to prepare the input for each binary and multi-class classifiers.
+
+```{r feature-matrix-scaling}
+
+# Matrix transposing, scaling works when features are cols
+expr_mat <- t(expr_mat)
+meth_mat <- t(meth_mat)
+
+# Keep omics type in colnames to identify features
+colnames(expr_mat) <- paste0("expr_", colnames(expr_mat))
+colnames(meth_mat) <- paste0("meth_", colnames(meth_mat))
+
+# Combine both matrix and standardize omics values (scale)
+combined_mat <- cbind(expr_mat, meth_mat)
+
+# Scale matrix
+scaled_combined_mat <- scale(combined_mat)
+
+cat("The combined scaled feature matrix contains", 
+    nrow(scaled_combined_mat), "samples and", 
+    ncol(scaled_combined_mat), "features.\n")
+
+```
+
+```{r save-train-mean-sd-mat}
+
+# Create "feature_matrices" folder if it does not exist
+feature_mat_dir <- "LUAD_feature_matrices"
+if (!dir.exists(feature_mat_dir)) dir.create(feature_mat_dir)
+
+# Save scaled combined matrix in feature_mat_dir
+saveRDS(scaled_combined_mat, 
+        file = file.path(feature_mat_dir, "LUAD_scaled_expr_meth_mat.rds"))
+
+# Extract and save mean and standard deviation to scale test data
+train_means <- attr(scaled_combined_mat, "scaled:center")
+train_sds <- attr(scaled_combined_mat, "scaled:scale")
+
+# Save to the feature_mat_dir
+saveRDS(train_means, file = file.path(feature_mat_dir, "train_scaling_means.rds"))
+saveRDS(train_sds, file = file.path(feature_mat_dir, "train_scaling_sds.rds"))
+
+```
+
+### Binary & Multi-class Classifier Feature Matrices Generation
+
+Each of our pairwise comparisons for methylation and gene expression produced a set of features for model training. This will be used to prepare feature matrices for binary classifiers. The union of the gene intersection will be used to generate a feature matrix for a multi-class classifier.
+
+```{r binary-feat-matrix}
+
+# Build final feature matrices from intersections and union gene sets
+
+# Define directories
+inter_dir <- "LUAD_intersections"
+out_dir <- "LUAD_feature_matrices"
+log_file <- "LUAD_feature_matrices/feature_matrix_log.txt"
+
+# Open log connection
+log_con <- file(log_file, open = "wt")
+sink(log_con, type = "output")
+
+# List gene intersection and union files
+inter_files <- list.files(inter_dir, pattern = "\\.csv$", full.names = TRUE)
+
+for (f in inter_files) {
+  comp <- tools::file_path_sans_ext(basename(f)) %>%
+    gsub("^Intersection_", "", .) %>%
+    gsub("^Union_", "union_", .)
+  
+  cat("\n>>> Processing:", comp, "\n")
+
+  genes <- read_csv(f, show_col_types = FALSE)$Gene %>% toupper()
+  
+  # Match columns in combined matrix (columns look like expr_X or meth_X)
+  expr_cols <- paste0("expr_", genes)
+  meth_cols <- paste0("meth_", genes)
+  gene_keep <- intersect(colnames(scaled_combined_mat), c(expr_cols, meth_cols))
+  
+  cat(" - Genes in input file:", length(genes), "\n")
+  cat(" - Matched columns in combined matrix:", length(gene_keep), "\n")
+  
+  if (length(gene_keep) < 5) {
+    cat(" !! Too few matched columns for", comp, "\n")
+    next
+  }
+  
+  # Subset feature matrix by genes
+  sub_df <- scaled_combined_mat[, gene_keep, drop = FALSE]
+  sub_df <- as.data.frame(sub_df)
+  
+  # Match sample short IDs to subtype mapping
+  sub_df$sample <- rownames(sub_df)
+  sub_df$short_id <- substr(sub_df$sample, 1, 12)
+  sub_df$subtype <- subtypes_train_filtered[sub_df$short_id]
+  
+  # Filter to keep only labeled samples
+  sub_df <- sub_df[!is.na(sub_df$subtype), ]
+  
+  # For intersections: filter to the two subtypes for pairwise comparison
+  if (grepl("^Intersection_", basename(f))) {
+    subtype_pair <- unlist(strsplit(comp, "_vs_"))
+    sub_df <- sub_df[sub_df$subtype %in% subtype_pair, ]
+
+    if (length(unique(sub_df$subtype)) != 2) {
+      cat(" !! Warning: expected 2 subtypes, found:", paste(unique(sub_df$subtype), collapse = ", "), "\n")
+    }
+  }
+  
+  # Clean up: drop short_id, reorder
+  sub_df$short_id <- NULL
+  sub_df <- sub_df[, c(setdiff(colnames(sub_df), c("sample", "subtype")), "sample", "subtype")]
+
+  cat(" - Samples:", nrow(sub_df), "\n")
+  cat(" - Features (expr + meth):", length(gene_keep), "\n")
+  cat(" - Total columns (incl. sample + label):", ncol(sub_df), "\n")
+
+  # Save final matrix
+  write_csv(sub_df, file.path(out_dir, paste0("feature_matrix_", comp, ".csv")))
+  saveRDS(sub_df, file.path(out_dir, paste0("feature_matrix_", comp, ".rds")))
+  cat(" - Saved to:", file.path(out_dir, paste0("feature_matrix_", comp, ".csv")), "\n")
+}
+
+# Close log
+sink()
+close(log_con)
+
+```
+
+# 2.6 Machine Learning
+
+## 2.6.1 Random Forest - Training, Tuning, Evaluation
+
+We trained a binary classifier per pairwise comparison, initially generating three binary Random Forest Classifiers.
+
+### proxProlif vs proxInflam Binary Classifier Training
+
+This classifier discriminates between subtype classes proxProlif and proxInflam based on methylation and expression data.
+
+#### Load Feature Matrix and Labels
+
+Feature matrix loading.
+
+```{r load-fm-pp-pi}
+
+set.seed(123)
+
+# Set the path to each LUAD training feature matrix
+feature_matrix_path <- "Feature Matrices Real Data/feature_matrix_proxProlif_vs_proxInflam.csv"
+label_col <- "subtype"  
+
+data <- read_csv(feature_matrix_path)
+str(data)
+head(data)
+
+# Remove sample column if present
+if ("sample" %in% colnames(data)) {
+  data <- data %>% dplyr::select(-sample)
+}
+# Remove rows where subtype is NA
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+```
+
+Model training.
+
+```{r rf-train-pp-pi}
+
+# Remove columns that are all NA
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Make sure all features are numeric except label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest
+na_threshold <- 0.2 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+# Train Random Forest on all imputed data
+
+# Weighted model to deal with moderate class imbalance
+rf_model_w <- ranger(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  num.trees = 500,
+  importance = "permutation",
+  class.weights = c(proxInflam = 1, proxProlif = 1.5)
+)
+
+rf_pred_obj <- predict(rf_model_w, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_w <- rf_pred_obj$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_w <- factor(rf_pred_w, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Confusion Matrix
+confusionMatrix(rf_pred_w, true_labels)
+
+```
+
+Cross-validation, tune model parameters and save final model.
+
+```{r rf-cv-pp-pi}
+
+cv_folds <- trainControl(method = "cv", number = 5)
+
+# Define mtry values to search over
+tune_grid <- expand.grid(
+  mtry = seq(30, 90, by = 15),
+  splitrule = "gini",
+  min.node.size = 5
+)
+
+# Cross-validation with grid search using ranger with class weights
+rf_cv <- train(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  method = "ranger",
+  trControl = cv_folds,
+  tuneGrid = tune_grid,
+  num.trees = 500,
+  importance = "permutation", 
+  weights = ifelse(data_imputed[[label_col]] == "proxProlif", 1.5, 1)
+)
+
+print(rf_cv)
+plot(varImp(rf_cv))
+
+# Retrain model with best mtry found by cv
+best_mtry <- rf_cv$bestTune$mtry
+best_splitrule <- rf_cv$bestTune$splitrule
+best_min_node_size <- rf_cv$bestTune$min.node.size
+
+rf_model_final <- ranger(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  num.trees = 500,
+  mtry = best_mtry,
+  splitrule = best_splitrule,
+  min.node.size = best_min_node_size,
+  importance = "permutation",
+  classification = TRUE,
+  class.weights = c(proxInflam = 1, proxProlif = 1.5)
+)
+
+# Predict on training data, sanity check
+rf_pred_obj_final <- predict(rf_model_final, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_final <- rf_pred_obj_final$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_final <- factor(rf_pred_final, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Confusion Matrix
+confusionMatrix(rf_pred_final, true_labels)
+
+saveRDS(rf_model_final, file = "LUAD_Random_Forests/rf_model_final_proxProlif_vs_proxInflam.rds")
+```
+
+#### Feature Importance
+
+Extract most important features for model accuracy, input for annotation step.
+
+```{r rf-pp-pi-feat_imp}
+
+# Extract feature importance from the ranger rf model final
+importance_tbl <- rf_model_final$variable.importance
+
+# Convert to data frame, sort descending and scale importance addition
+importance_df <- data.frame(
+  feature = names(importance_tbl),
+  importance = as.numeric(importance_tbl)
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    scaled_importance = (importance - min(importance)) / (max(importance) - min(importance))
+  )
+
+# Save results
+write.csv(importance_df, file = "important_features_proxProlif_vs_proxInflam.csv", row.names = FALSE)
+saveRDS(importance_df, file = "important_features_proxProlif_vs_proxInflam.rds")
+
+```
+
+```{r rf-pp-pi-feat-imp-plot}
+# Feature Importance Plot
+library(ggplot2)
+top_n <- 20
+ggplot(head(importance_df, top_n), aes(x = reorder(feature, importance_df[[1]]), y = importance_df[[1]])) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Variable Importances", x = "Feature", y = "Importance (Permutation)")
+```
+
+### TRU vs proxInflam Binary Classifier Training
+
+This classifier discriminates between subtype classes TRU and proxInflam based on methylation and expression data.
+
+#### Load Feature Matrix and Labels
+
+```{r load-fm-tru-pi}
+
+set.seed(123)
+
+# Set the path to each LUAD training feature matrix
+feature_matrix_path <- "Feature Matrices Real Data/feature_matrix_TRU_vs_proxInflam.csv"
+label_col <- "subtype"  
+
+data <- read_csv(feature_matrix_path)
+str(data)
+head(data)
+
+# Remove sample column if present
+if ("sample" %in% colnames(data)) {
+  data <- data %>% dplyr::select(-sample)
+}
+# Remove rows where subtype is NA
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+```
+
+Model training.
+
+```{r rf-train-tru-pi}
+
+# Remove columns that are all NA
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Make sure all features are numeric except label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest
+na_threshold <- 0.2 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+# Train Random Forest on all imputed data
+
+# Classes are balanced, 57, 58 samples, no weights needed
+rf_model <- ranger(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  num.trees = 500,
+  importance = "permutation",
+)
+
+# Predict on training data, sanity check
+rf_pred_obj <- predict(rf_model, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred <- rf_pred_obj$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred <- factor(rf_pred, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Confusion Matrix
+confusionMatrix(rf_pred, true_labels)
+
+```
+
+Cross-validation, tune model parameters and save final model.
+
+```{r rf-cv-tru-pi}
+
+cv_folds <- trainControl(method = "cv", number = 5)
+
+# Define mtry values to search over
+tune_grid <- expand.grid(
+  mtry = seq(30, 70, by = 10),   # centered around 49, sqrt of # features
+  splitrule = "gini",
+  min.node.size = 5
+)
+
+# Cross-validation with grid search using ranger
+rf_cv <- train(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  method = "ranger",
+  trControl = cv_folds,
+  tuneGrid = tune_grid,
+  num.trees = 500,
+  importance = "permutation", 
+)
+
+print(rf_cv)
+plot(varImp(rf_cv))
+
+# Retrain model with best mtry found by cv
+best_mtry <- rf_cv$bestTune$mtry
+best_splitrule <- rf_cv$bestTune$splitrule
+best_min_node_size <- rf_cv$bestTune$min.node.size
+
+rf_model_final <- ranger(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  num.trees = 500,
+  mtry = best_mtry,
+  splitrule = best_splitrule,
+  min.node.size = best_min_node_size,
+  importance = "permutation",
+  classification = TRUE,
+)
+
+# Predict on training data, sanity check
+rf_pred_obj_final <- predict(rf_model_final, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_final <- rf_pred_obj_final$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_final <- factor(rf_pred_final, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Confusion Matrix
+confusionMatrix(rf_pred_final, true_labels)
+
+saveRDS(rf_model_final, file = "LUAD_Random_Forests/rf_model_final_TRU_vs_proxInflam.rds")
+```
+
+#### Feature Importance
+
+Extract most important features for model accuracy, input for annotation step.
+
+```{r rf-tru-pi-feat_imp}
+
+# Extract feature importance from the ranger rf model final
+importance_tbl <- rf_model_final$variable.importance
+
+# Convert to data frame, sort descending and scale importance addition
+importance_df <- data.frame(
+  feature = names(importance_tbl),
+  importance = as.numeric(importance_tbl)
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    scaled_importance = (importance - min(importance)) / (max(importance) - min(importance))
+  )
+
+# Save results
+write.csv(importance_df, file = "important_features_TRU_vs_proxInflam.csv", row.names = FALSE)
+saveRDS(importance_df, file = "important_features_TRU_vs_proxInflam.rds")
+
+```
+
+```{r rf-tru-pi-feat-imp-plot}
+
+# Feature Importance Plot
+library(ggplot2)
+top_n <- 20
+ggplot(head(importance_df, top_n), aes(x = reorder(feature, importance_df[[1]]), y = importance_df[[1]])) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Variable Importances", x = "Feature", y = "Importance (Permutation)")
+```
+
+### TRU vs proxProlif Binary Classifier Training
+
+This classifier discriminates between subtype classes TRU and proxProlif based on methylation and expression data.
+
+#### Load Feature Matrix and Labels
+
+```{r load-fm-tru-pp}
+
+set.seed(123)
+
+# Set the path to each LUAD training feature matrix
+feature_matrix_path <- "Feature Matrices Real Data/feature_matrix_TRU_vs_proxProlif.csv"
+label_col <- "subtype"  
+
+data <- read_csv(feature_matrix_path)
+str(data)
+head(data)
+
+# Remove sample column if present
+if ("sample" %in% colnames(data)) {
+  data <- data %>% dplyr::select(-sample)
+}
+# Remove rows where subtype is NA
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+```
+
+Training model.
+
+```{r rf-train-tru-pp}
+# Remove columns that are all NA
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Make sure all features are numeric except label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest
+na_threshold <- 0.2 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+# Train Random Forest on all imputed data
+
+# Weighted model to deal with moderate class imbalance
+rf_model_w <- ranger(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  num.trees = 500,
+  importance = "permutation",
+  class.weights = c(TRU = 1, proxProlif = 1.5)
+)
+
+rf_pred_obj <- predict(rf_model_w, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_w <- rf_pred_obj$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_w <- factor(rf_pred_w, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Confusion Matrix
+confusionMatrix(rf_pred_w, true_labels)
+
+```
+
+Cross-validation, tune model parameters and save final model.
+
+```{r rf-cv-tru-pp}
+cv_folds <- trainControl(method = "cv", number = 5)
+
+# Define mtry values to search over
+tune_grid <- expand.grid(
+  mtry = c(45, 55, 60, 65, 75),  # centered around sqrt(# features)
+  splitrule = "gini",
+  min.node.size = 5
+)
+
+# Cross-validation with grid search using ranger with class weights
+rf_cv <- train(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  method = "ranger",
+  trControl = cv_folds,
+  tuneGrid = tune_grid,
+  num.trees = 500,
+  importance = "permutation", 
+  weights = ifelse(data_imputed[[label_col]] == "proxProlif", 1.5, 1)
+)
+
+print(rf_cv)
+plot(varImp(rf_cv))
+
+# Retrain model with best mtry found by cv
+best_mtry <- rf_cv$bestTune$mtry
+best_splitrule <- rf_cv$bestTune$splitrule
+best_min_node_size <- rf_cv$bestTune$min.node.size
+
+rf_model_final <- ranger(
+  x = data_imputed %>% dplyr::select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  num.trees = 500,
+  mtry = best_mtry,
+  splitrule = best_splitrule,
+  min.node.size = best_min_node_size,
+  importance = "permutation",
+  classification = TRUE,
+  class.weights = c(TRU = 1, proxProlif = 1.5)
+)
+
+# Predict on training data, sanity check
+rf_pred_obj_final <- predict(rf_model_final, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_final <- rf_pred_obj_final$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_final <- factor(rf_pred_final, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Confusion Matrix
+confusionMatrix(rf_pred_final, true_labels)
+
+saveRDS(rf_model_final, file = "LUAD_Random_Forests/rf_model_final_TRU_vs_proxProlif.rds")
+```
+
+#### Feature Importance
+
+Extract most important features for model accuracy, input for annotation step.
+
+```{r rf-tru-pp-feat_imp}
+
+# Extract feature importance from the ranger rf model final
+importance_tbl <- rf_model_final$variable.importance
+
+# Convert to data frame, sort descending and scale importance addition
+importance_df <- data.frame(
+  feature = names(importance_tbl),
+  importance = as.numeric(importance_tbl)
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    scaled_importance = (importance - min(importance)) / (max(importance) - min(importance))
+  )
+
+# Save results
+write.csv(importance_df, file = "important_features_TRU_vs_proxProlif.csv", row.names = FALSE)
+saveRDS(importance_df, file = "important_features_TRU_vs_proxProlif.rds")
+
+```
+
+```{r rf-tru-pp-feat-imp-plot}
+
+# Feature Importance Plot
+library(ggplot2)
+top_n <- 20
+ggplot(head(importance_df, top_n), aes(x = reorder(feature, importance_df[[1]]), y = importance_df[[1]])) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Variable Importances", x = "Feature", y = "Importance (Permutation)")
+```
+
+### Random Forest Multi-class Classifier
+
+This classifier was trained using the feature matrix created with the union of the significant genes found in our differential gene expression and methylation analyses.
+
+#### Load Feature Matrix and Labels
+
+```{r load-fm-rf-multiclass}
+
+# Seting a random seed for reproducibility
+set.seed(123)
+
+# Create folders for organized output
+model_dir <- "RF_results"
+if (!dir.exists(model_dir)) dir.create(model_dir)
+train_pred_dir <- file.path(model_dir, "Predictions_Train")
+if (!dir.exists(train_pred_dir)) dir.create(train_pred_dir)
+test_pred_dir <- file.path(model_dir, "Predictions_Test")
+if (!dir.exists(test_pred_dir)) dir.create(test_pred_dir)
+train_conf_dir <- file.path(model_dir, "ConfusionMatrices_Train")
+if (!dir.exists(train_conf_dir)) dir.create(train_conf_dir)
+test_conf_dir <- file.path(model_dir, "ConfusionMatrices_Test")
+if (!dir.exists(test_conf_dir)) dir.create(test_conf_dir)
+train_plots_dir <- file.path(model_dir, "Plots_Train")
+if (!dir.exists(train_plots_dir)) dir.create(train_plots_dir)
+test_plots_dir <- file.path(model_dir, "Plots_Test")
+if (!dir.exists(test_plots_dir)) dir.create(test_plots_dir)
+imp_dir <- file.path(model_dir, "Importance")
+if (!dir.exists(imp_dir)) dir.create(imp_dir)
+bootstrap_dir <- file.path(model_dir, "Bootstrap")
+if (!dir.exists(bootstrap_dir)) dir.create(bootstrap_dir)
+
+feature_matrix_path <- "Feature Matrices Real Data/feature_matrix_union_Subtype_Intersected_Genes.csv"
+label_col <- "subtype"
+
+data <- read_csv(feature_matrix_path)
+if ("sample" %in% colnames(data)) data <- data %>% select(-sample)
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+cat("Class distribution:\n")
+print(table(data[[label_col]]))
+
+# Remove all-NA columns
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Keep only numeric features + label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest
+na_threshold <- 0.2 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+```
+
+Multi-class Model Training.
+
+```{r rf-multiclass-train}
+
+# Train multiclass random forest model
+rf_model <- randomForest(
+  x = data_imputed %>% select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  ntree = 500,
+  importance = TRUE
+)
+
+# Predict on the training data
+rf_pred <- predict(rf_model, data_imputed %>% select(-all_of(label_col)))
+
+# Generate confusion matrix for training data
+cm_train <- confusionMatrix(rf_pred, data_imputed[[label_col]])
+
+# Converting confusion matrix to dataframe for saving/plotting
+cm_tbl <- as.data.frame(cm_train$table)
+
+# Plotting confusion matrix
+p_cm <- ggplot(cm_tbl, aes(Prediction, Reference, fill=Freq)) +
+  geom_tile() +
+  geom_text(aes(label=Freq), size=6) +
+  scale_fill_gradient(low="white", high="steelblue") +
+  theme_minimal() +
+  labs(title="Confusion Matrix (Train set)", x="Predicted", y="True")
+
+# Save confusion matrix plot
+ggsave(file.path(train_plots_dir, "confusion_matrix_train_union_Subtype_Intersected_Genes.png"), plot=p_cm, width=6, height=5)
+
+# Save confusion matrix as CSV and RDS
+write.csv(cm_tbl, file.path(train_conf_dir, "confusion_matrix_train_union_Subtype_Intersected_Genes.csv"), row.names=FALSE)
+saveRDS(cm_train, file.path(train_conf_dir, "confusion_matrix_train_union_Subtype_Intersected_Genes.rds"))
+
+# Feature Importance Extraction
+# Extracting importance scores (MeanDecreaseAccuracy)
+importance_tbl <- importance(rf_model, type=1)
+importance_df <- as.data.frame(importance_tbl)
+importance_df$feature <- rownames(importance_df)
+
+# Sorting by importance descending
+importance_df <- importance_df %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Save importance scores as CSV and RDS
+write.csv(importance_df, file.path(imp_dir, "important_features_union_Subtype_Intersected_Genes.csv"), row.names=FALSE)
+saveRDS(importance_df, file.path(imp_dir, "important_features_union_Subtype_Intersected_Genes.rds"))
+
+# Plotting and save feature importance
+png(file.path(train_plots_dir, "varImpPlot_train_union_Subtype_Intersected_Genes.png"), width=800, height=500)
+varImpPlot(rf_model, main="Train Feature Importance")
+dev.off()
+```
+
+Cross-validation, tune multi-class model parameters and save final multi-class model.
+
+```{r rf-multiclass-cv}
+
+# Set up 5-fold cross-validation
+cv_folds <- trainControl(method = "cv", number = 5)
+
+# Train Random Forest model with cross-validation to tune 'mtry'
+rf_cv <- train(
+  x = data_imputed %>% select(-all_of(label_col)),
+  y = data_imputed[[label_col]],
+  method = "rf",
+  trControl = cv_folds,
+  ntree = 500,
+  importance = TRUE
+)
+
+# Print cross-validation summary (accuracy per mtry value)
+print(rf_cv)
+
+# Extract the best 'mtry' value (number of features considered at each split)
+best_mtry <- rf_cv$bestTune$mtry
+
+# Retrain the final model using the best 'mtry'
+rf_model_final <- randomForest(
+  x = data_imputed %>% select(-all_of(label_col)),  
+  y = data_imputed[[label_col]],                   
+  ntree = 500,
+  mtry = best_mtry, # Use best mtry found by CV
+  importance = TRUE
+)
+
+# Save the final trained model
+saveRDS(rf_model_final, file.path(model_dir, "rf_model_final_union_Subtype_Intersected_Genes.rds"))
+```
+
+## 2.6.2 Support Vector Machines - Training, Tuning, Evaluation
+
+### Binary SVM Classifiers - Train & Test Data 
+
+Load feature matrices for both test and training sets. \
+\
+**NOTE:** For practicality, we have automated the generation of SVM results, including testing the models on the test set.
+
+```{r svm-fm-paths}
+
+train_dir <- "Feature Matrices Real Data"
+test_dir <- "Test Data/LUAD_feature_matrices"
+
+model_dir <- "SVM_results"
+dir.create(model_dir, showWarnings=FALSE)
+pred_dir <- file.path(model_dir, "Predictions"); dir.create(pred_dir, showWarnings=FALSE)
+conf_dir <- file.path(model_dir, "ConfusionMatrices"); dir.create(conf_dir, showWarnings=FALSE)
+imp_dir <- file.path(model_dir, "Importance"); dir.create(imp_dir, showWarnings=FALSE)
+plots_dir <- file.path(model_dir, "Plots"); dir.create(plots_dir, showWarnings=FALSE)
+
+train_files <- list.files(train_dir, pattern = "\\.csv$", full.names = TRUE)
+results_list <- list()
+```
+
+SVM models training, model tuning, saving final mode, final feature importance extraction and bootstraping.
+
+```{r svm-train}
+for (train_path in train_files) {
+  comp <- tools::file_path_sans_ext(basename(train_path)) %>% gsub("^feature_matrix_", "", .)
+  test_path <- file.path(test_dir, paste0("test_input_matrix_", comp, ".csv"))
+
+  # Load data
+  train <- read_csv(train_path)
+  test  <- read_csv(test_path)
+
+  if ("sample" %in% colnames(train)) train <- train %>% select(-sample)
+  train <- train %>% filter(!is.na(subtype))
+  train$subtype <- as.factor(train$subtype)
+  if ("sample" %in% colnames(test)) test <- test %>% select(-sample)
+  test <- test %>% filter(!is.na(subtype))
+  test$subtype <- as.factor(test$subtype)
+
+  X <- train %>% select(-subtype)
+  y <- train$subtype
+  Xtest <- test %>% select(-subtype)
+  ytest <- test$subtype
+
+  for (col in colnames(X)) X[[col]][is.na(X[[col]])] <- median(X[[col]], na.rm=TRUE)
+  for (col in colnames(Xtest)) if (col %in% colnames(X)) Xtest[[col]][is.na(Xtest[[col]])] <- median(X[[col]], na.rm=TRUE)
+
+  keep_cols <- sapply(X, function(col) !(all(is.na(col)) | sd(col, na.rm=TRUE) == 0))
+  X <- X[, keep_cols, drop=FALSE]
+  Xtest <- Xtest[, colnames(X), drop=FALSE]
+
+  # Feature selection: top 200 features by variance (if many)
+  if (ncol(X) > 200) {
+    vars <- apply(X, 2, var)
+    top_vars <- order(vars, decreasing = TRUE)[1:200]
+    X <- X[, top_vars, drop=FALSE]
+    Xtest <- Xtest[, colnames(X), drop=FALSE]
+  }
+
+  # Class weights for imbalance
+  wtable <- table(y)
+  class_weights <- as.numeric(max(wtable) / wtable)
+  names(class_weights) <- names(wtable)
+
+  cat("Class distribution:", paste(names(wtable), wtable, collapse = " "), "\n")
+
+  # Grid search for C
+  c_grid <- c(0.01, 0.1, 1, 10, 100)
+  tune_result <- tryCatch({
+    tune(
+      svm,
+      train.x = X,
+      train.y = y,
+      kernel = "linear",
+      ranges = list(cost = c_grid),
+      class.weights = class_weights,
+      scale = FALSE,
+      probability = TRUE,
+      cross = 3
+    )
+  }, error = function(e) {
+    cat("Grid search failed:\n"); print(e)
+    return(NULL)
+  })
+
+  if (is.null(tune_result) || is.null(tune_result$best.parameters$cost)) {
+    cat("Grid search failed or cost not found, using cost=1 by default.\n")
+    best_C <- 1
+  } else {
+    best_C <- tune_result$best.parameters$cost
+    cat("Best cost found:", best_C, "\n")
+  }
+
+  # Fit final model
+  svm_final <- svm(
+    x = X,
+    y = y,
+    kernel = "linear",
+    cost = best_C,
+    class.weights = class_weights,
+    scale = FALSE,
+    probability = TRUE
+  )
+  saveRDS(svm_final, file=file.path(model_dir, paste0("svm_model_", comp, ".rds")))
+
+  # Predict and evaluate
+  pred <- predict(svm_final, Xtest)
+  conf <- caret::confusionMatrix(pred, ytest)
+  write_csv(tibble(True=ytest, Pred=pred), file=file.path(pred_dir, paste0("predictions_", comp, ".csv")))
+  saveRDS(conf, file=file.path(conf_dir, paste0("confMat_", comp, ".rds")))
+
+  # Confusion matrix plot
+  cm_table <- as.data.frame(conf$table)
+  p_cm <- ggplot(cm_table, aes(x=Prediction, y=Reference, fill=Freq)) +
+    geom_tile() + geom_text(aes(label=Freq), size=6) +
+    scale_fill_gradient(low="white", high="steelblue") + theme_minimal() +
+    labs(title=paste("Confusion Matrix -", comp), x="Predicted", y="True")
+  ggsave(file.path(plots_dir, paste0("confusion_matrix_", comp, ".png")), plot=p_cm, width=5, height=4)
+
+  # Feature importance (t-test/ANOVA)
+  if (nlevels(y) == 2) {
+    imp_vec <- sapply(X, function(x) abs(t.test(x ~ y)$statistic))
+  } else {
+    imp_vec <- sapply(X, function(x) summary(aov(x ~ y))[[1]][["F value"]][1])
+  }
+  imp_vec <- sort(imp_vec, decreasing=TRUE)
+  imp_df <- data.frame(Feature = names(imp_vec), Importance = as.numeric(imp_vec))
+  write_csv(imp_df, file.path(imp_dir, paste0("feature_importance_", comp, ".csv")))
+
+  # Bootstrapping
+  n_boot <- 1000
+  accs <- numeric(n_boot)
+  sens <- numeric(n_boot)
+  spec <- numeric(n_boot)
+  kappas <- numeric(n_boot)
+  for (i in 1:n_boot) {
+    idx <- sample(seq_along(ytest), replace=TRUE)
+    yb <- ytest[idx]
+    xb <- Xtest[idx, , drop=FALSE]
+    pb <- predict(svm_final, xb)
+    cm <- caret::confusionMatrix(pb, yb)
+    accs[i] <- cm$overall["Accuracy"]
+    if (is.matrix(cm$byClass)) {
+      sens[i] <- mean(cm$byClass[,"Sensitivity"], na.rm=TRUE)
+      spec[i] <- mean(cm$byClass[,"Specificity"], na.rm=TRUE)
+    } else {
+      sens[i] <- cm$byClass["Sensitivity"]
+      spec[i] <- cm$byClass["Specificity"]
+    }
+    kappas[i] <- cm$overall["Kappa"]
+  }
+  # Save bootstrapping results
+  boot_df <- tibble(
+    accuracy = accs, sensitivity = sens, specificity = spec, kappa = kappas
+  )
+  write_csv(boot_df, file=file.path(model_dir, paste0("bootstrap_results_", comp, ".csv")))
+  saveRDS(boot_df, file=file.path(model_dir, paste0("bootstrap_results_", comp, ".rds")))
+
+  # Bootstrapping plots
+  p_hist <- ggplot(boot_df, aes(x=accuracy)) +
+    geom_histogram(bins=30, fill="#1f77b4", color="white") +
+    theme_minimal() +
+    labs(title=paste("Bootstrap Accuracy -", comp), x="Accuracy", y="Count")
+  ggsave(file.path(plots_dir, paste0("bootstrap_hist_accuracy_", comp, ".png")), plot=p_hist, width=6, height=4)
+
+  boot_long <- boot_df %>% pivot_longer(everything(), names_to="Metric", values_to="Value")
+  p_box <- ggplot(boot_long, aes(x=Metric, y=Value, fill=Metric)) +
+    geom_boxplot(alpha=0.7) + theme_minimal() +
+    scale_fill_brewer(palette="Set2") +
+    labs(title=paste("Bootstrap Metrics -", comp))
+  ggsave(file.path(plots_dir, paste0("bootstrap_boxplot_metrics_", comp, ".png")), plot=p_box, width=6, height=4)
+
+  results_list[[comp]] <- list(
+    confusion = conf, accs = accs, sens = sens, spec = spec,
+    kappas = kappas, best_C = best_C, class_weights = class_weights
+  )
+}
+```
+
+### Multi-class SVM Classifier
+
+This model will be trained using the union of the gene intersections of our significant differentially expressed and methylated genes.\
+\
+**NOTE:** For practicality, we have automated the generation of SVM results, including testing the models on the test set.
+
+```{r svm-multiclass-paths}
+
+model_dir <- "SVM_results_multiclass"
+dir.create(model_dir, showWarnings=FALSE)
+pred_dir <- file.path(model_dir, "Predictions"); dir.create(pred_dir, showWarnings=FALSE)
+conf_dir <- file.path(model_dir, "ConfusionMatrices"); dir.create(conf_dir, showWarnings=FALSE)
+imp_dir <- file.path(model_dir, "Importance"); dir.create(imp_dir, showWarnings=FALSE)
+plots_dir <- file.path(model_dir, "Plots"); dir.create(plots_dir, showWarnings=FALSE)
+bootstrap_dir <- file.path(model_dir, "Bootstrap"); dir.create(bootstrap_dir, showWarnings=FALSE)
+
+train_path <- "Feature Matrices Real Data/feature_matrix_union_Subtype_Intersected_Genes.csv"
+test_path <- "Test Data/LUAD_feature_matrices/test_input_matrix_union_Subtype_Intersected_Genes.csv"
+comp <- "union_Subtype_Intersected_Genes"
+
+# Load data
+train <- read_csv(train_path)
+test  <- read_csv(test_path)
+
+if ("sample" %in% colnames(train)) train <- train %>% select(-sample)
+train <- train %>% filter(!is.na(subtype))
+train$subtype <- as.factor(train$subtype)
+if ("sample" %in% colnames(test)) test <- test %>% select(-sample)
+test <- test %>% filter(!is.na(subtype))
+test$subtype <- as.factor(test$subtype)
+
+X <- train %>% select(-subtype)
+y <- train$subtype
+Xtest <- test %>% select(-subtype)
+ytest <- test$subtype
+
+# Impute NAs (median for numeric columns)
+for (col in colnames(X)) X[[col]][is.na(X[[col]])] <- median(X[[col]], na.rm=TRUE)
+for (col in colnames(Xtest)) if (col %in% colnames(X)) Xtest[[col]][is.na(Xtest[[col]])] <- median(X[[col]], na.rm=TRUE)
+
+# Remove all-NA and zero-variance cols
+keep_cols <- sapply(X, function(col) !(all(is.na(col)) | sd(col, na.rm=TRUE) == 0))
+X <- X[, keep_cols, drop=FALSE]
+Xtest <- Xtest[, colnames(X), drop=FALSE]
+```
+
+Multi-class SVM model training, parameter tuning, bootstrapping, saving final model, and feature importance extraction for annotation.
+
+```{r svm-multiclass-train}
+
+# Feature selection: top 200 features by variance (if many)
+if (ncol(X) > 200) {
+  vars <- apply(X, 2, var)
+  top_vars <- order(vars, decreasing = TRUE)[1:200]
+  X <- X[, top_vars, drop=FALSE]
+  Xtest <- Xtest[, colnames(X), drop=FALSE]
+}
+
+# Class weights for imbalance (works for multiclass)
+wtable <- table(y)
+class_weights <- as.numeric(max(wtable) / wtable)
+names(class_weights) <- names(wtable)
+cat("Class distribution:", paste(names(wtable), wtable, collapse = " "), "\n")
+
+# Grid search for C 
+c_grid <- c(0.01, 0.1, 1, 10, 100)
+tune_result <- tryCatch({
+  tune(
+    svm,
+    train.x = X,
+    train.y = y,
+    kernel = "linear",
+    ranges = list(cost = c_grid),
+    class.weights = class_weights,
+    scale = FALSE,
+    probability = TRUE,
+    cross = 3
+  )
+}, error = function(e) {
+  cat("Grid search failed:\n"); print(e)
+  return(NULL)
+})
+
+if (is.null(tune_result) || is.null(tune_result$best.parameters$cost)) {
+  cat("Grid search failed or cost not found, using cost=1 by default.\n")
+  best_C <- 1
+} else {
+  best_C <- tune_result$best.parameters$cost
+  cat("Best cost found:", best_C, "\n")
+}
+
+# Fit final model 
+svm_final <- svm(
+  x = X,
+  y = y,
+  kernel = "linear",
+  cost = best_C,
+  class.weights = class_weights,
+  scale = FALSE,
+  probability = TRUE
+)
+saveRDS(svm_final, file=file.path(model_dir, paste0("svm_model_", comp, ".rds")))
+
+# Predict and evaluate 
+pred <- predict(svm_final, Xtest)
+conf <- caret::confusionMatrix(pred, ytest)
+write_csv(tibble(True=ytest, Pred=pred), file=file.path(pred_dir, paste0("predictions_", comp, ".csv")))
+saveRDS(conf, file=file.path(conf_dir, paste0("confMat_", comp, ".rds")))
+
+# Confusion matrix plot
+cm_table <- as.data.frame(conf$table)
+p_cm <- ggplot(cm_table, aes(x=Prediction, y=Reference, fill=Freq)) +
+  geom_tile() + geom_text(aes(label=Freq), size=6) +
+  scale_fill_gradient(low="white", high="steelblue") + theme_minimal() +
+  labs(title=paste("Confusion Matrix -", comp), x="Predicted", y="True")
+ggsave(file.path(plots_dir, paste0("confusion_matrix_", comp, ".png")), plot=p_cm, width=5, height=4)
+
+# Feature importance: multiclass via ANOVA F-value 
+imp_vec <- sapply(X, function(x) summary(aov(x ~ y))[[1]][["F value"]][1])
+imp_vec <- sort(imp_vec, decreasing=TRUE)
+imp_df <- data.frame(Feature = names(imp_vec), Importance = as.numeric(imp_vec))
+write_csv(imp_df, file.path(imp_dir, paste0("feature_importance_", comp, ".csv")))
+
+# Bootstrapping (test set metrics) 
+n_boot <- 1000
+accs <- numeric(n_boot)
+sens <- numeric(n_boot)
+spec <- numeric(n_boot)
+kappas <- numeric(n_boot)
+for (i in 1:n_boot) {
+  idx <- sample(seq_along(ytest), replace=TRUE)
+  yb <- ytest[idx]
+  xb <- Xtest[idx, , drop=FALSE]
+  pb <- predict(svm_final, xb)
+  cm <- caret::confusionMatrix(pb, yb)
+  accs[i] <- cm$overall["Accuracy"]
+  # Sens/spec: average all classes (multiclass)
+  sens[i] <- mean(cm$byClass[,"Sensitivity"], na.rm=TRUE)
+  spec[i] <- mean(cm$byClass[,"Specificity"], na.rm=TRUE)
+  kappas[i] <- cm$overall["Kappa"]
+}
+# Save bootstrapping results
+boot_df <- tibble(
+  accuracy = accs, sensitivity = sens, specificity = spec, kappa = kappas
+)
+write_csv(boot_df, file=file.path(bootstrap_dir, paste0("bootstrap_results_", comp, ".csv")))
+saveRDS(boot_df, file=file.path(bootstrap_dir, paste0("bootstrap_results_", comp, ".rds")))
+
+# Bootstrapping plots 
+p_hist <- ggplot(boot_df, aes(x=accuracy)) +
+  geom_histogram(bins=30, fill="#1f77b4", color="white") +
+  theme_minimal() +
+  labs(title=paste("Bootstrap Accuracy -", comp), x="Accuracy", y="Count")
+ggsave(file.path(plots_dir, paste0("bootstrap_hist_accuracy_", comp, ".png")), plot=p_hist, width=6, height=4)
+
+boot_long <- boot_df %>% pivot_longer(everything(), names_to="Metric", values_to="Value")
+p_box <- ggplot(boot_long, aes(x=Metric, y=Value, fill=Metric)) +
+  geom_boxplot(alpha=0.7) + theme_minimal() +
+  scale_fill_brewer(palette="Set2") +
+  labs(title=paste("Bootstrap Metrics -", comp))
+ggsave(file.path(plots_dir, paste0("bootstrap_boxplot_metrics_", comp, ".png")), plot=p_box, width=6, height=4)
+
+# Save summary in results_list
+results_list <- list()
+results_list[[comp]] <- list(
+  confusion = conf, accs = accs, sens = sens, spec = spec,
+  kappas = kappas, best_C = best_C, class_weights = class_weights
+)
+```
+
+After Data Modeling, we have produced, trained and tuned binary Random Forest and SVM Classifiers, as well as Multi-class Random Forest and SVM classifiers.
