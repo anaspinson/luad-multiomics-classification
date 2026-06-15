@@ -79,21 +79,82 @@ Biological Annotation
 
 ## Repository Structure
 
+## Repository Structure
+
 ```text
-01_data_preprocessing_and_integration.Rmd
-    Data acquisition, preprocessing, filtering and integration
+luad-multiomics-classification/
+│
+├── README.md
+│   Project overview, workflow, results and instructions
+│
+├── ABOUT_THE_PROJECT.md
+│   Project background, contributions and lessons learned
+│
+├── docs/
+│   ├── README.md
+│   └── Final_Project_Report.pdf
+│
+├── notebooks/
+│   ├── README.md
+│   ├── 01_data_preprocessing_and_integration.Rmd
+│   ├── 02_feature_selection_and_model_training.Rmd
+│   ├── 03_model_testing_and_evaluation.Rmd
+│   └── 04_biological_annotation.Rmd
+│
+├── figures/
+│   ├── README.md
+│   └── project_figures
+│
+├── results/
+│   ├── README.md
+│   └── analysis_outputs
+│
+└── environment/
+    ├── README.md
+    └── session_info.txt
 
-02_feature_selection_and_model_training.Rmd
-    Differential analyses, feature engineering and model training
-
-03_model_evaluation.Rmd
-    Test data evaluation and performance metrics
-
-04_biological_annotation.Rmd
-    Pathway enrichment and biological interpretation
-```
+This shows the complete repository.
 
 ---
+
+## Section 2: Analysis Workflow
+
+Then immediately below:
+
+````markdown
+## Analysis Workflow
+
+The notebooks are intended to be executed sequentially.
+
+### 01 Data Preprocessing and Integration
+
+- Download TCGA LUAD datasets
+- Perform quality control
+- Filter samples and genes
+- Match RNA-seq and methylation samples
+- Create training and testing datasets
+
+### 02 Feature Selection and Model Training
+
+- Differential expression analysis (DESeq2)
+- Differential methylation analysis (limma)
+- Multi-omics feature selection
+- Random Forest training
+- Support Vector Machine training
+
+### 03 Model Evaluation
+
+- Evaluate models on independent test data
+- Generate confusion matrices
+- Calculate performance metrics
+- Bootstrap validation
+
+### 04 Biological Annotation
+
+- Pathway enrichment analysis
+- Functional annotation
+- Gene overlap analysis
+- Biological interpretation
 
 ## Results
 
