@@ -113,15 +113,8 @@ luad-multiomics-classification/
 
 ```
 
-This shows the complete repository.
-
 ---
 
-## Section 2: Analysis Workflow
-
-Then immediately below:
-
-````markdown
 ## Analysis Workflow
 
 The notebooks are intended to be executed sequentially.
