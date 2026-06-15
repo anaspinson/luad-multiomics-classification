@@ -65,42 +65,83 @@ To achieve this, a complete multi-omics machine learning pipeline was developed,
 ## Workflow
 
 ```text
-RNA-seq Data
-       +
-DNA Methylation Data
-       +
-Clinical Labels
-          │
-          ▼
-Data Cleaning & Quality Control
-          │
-          ▼
-Sample Matching Across Omics Layers
-          │
-          ▼
-Differential Expression Analysis
-(DESeq2)
-          │
-          ▼
-Differential Methylation Analysis
-(limma)
-          │
-          ▼
-Feature Selection
-(DEGs ∩ DMPs)
-          │
-          ▼
-Multi-Omics Integration
-          │
-          ▼
-Machine Learning Models
-(Random Forest + SVM)
-          │
-          ▼
-Model Evaluation
-          │
-          ▼
-Biological Annotation
+TCGA LUAD DATA
+
+├── RNA-seq (recount3)
+├── DNA Methylation (TCGAbiolinks)
+└── Clinical Labels (curatedTCGAData)
+
+```
+            ↓
+```
+
+DATA PREPROCESSING
+
+├── Quality Control
+├── Sample Filtering
+├── Gene Filtering
+├── Clinical Harmonization
+└── Stratified Train/Test Split
+
+```
+            ↓
+```
+
+MULTI-OMICS INTEGRATION
+
+├── Sample Matching
+├── Expression Matrix
+├── Methylation Matrix
+└── Combined Feature Matrix
+
+```
+            ↓
+```
+
+FEATURE SELECTION
+
+├── DESeq2
+│   Differential Expression
+│
+├── limma
+│   Differential Methylation
+│
+└── DEG ∩ DMP Intersection
+
+```
+            ↓
+```
+
+MACHINE LEARNING
+
+├── Random Forest
+├── Support Vector Machine
+├── Cross Validation
+└── Bootstrap Validation
+
+```
+            ↓
+```
+
+MODEL EVALUATION
+
+├── Binary Classification
+├── Multi-class Classification
+├── Confusion Matrices
+└── Performance Metrics
+
+```
+            ↓
+```
+
+BIOLOGICAL INTERPRETATION
+
+├── Feature Importance
+├── GO Enrichment
+├── KEGG Enrichment
+├── Reactome Analysis
+└── Candidate Biomarkers
+
 ```
 ---
 
