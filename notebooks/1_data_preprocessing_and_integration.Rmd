@@ -1,15 +1,42 @@
 ---
-title: "1: TCGA LUAD Data Download & Integration Steps"
+
+title: "LUAD Multi-Omics Classification: Data Preprocessing and Integration"
 output:
-  html_document:
-    df_print: paged
----
+html_document:
+df_print: paged
+---------------
 
-# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+# Data Preprocessing and Integration
 
-**Silvia Cambiago\
-Sofiia Hoian\
-Ana Belen Solis Pinson**
+## Project Overview
+
+This notebook performs data acquisition, preprocessing, quality control, and integration of transcriptomic (RNA-seq), DNA methylation, and clinical data from TCGA Lung Adenocarcinoma (LUAD) samples.
+
+The objective is to generate a harmonized multi-omics dataset suitable for downstream differential analysis, feature selection, and machine learning classification.
+
+## Pipeline Position
+
+Step 1 of 4
+
+Data Acquisition → Data Integration → Feature Selection & Modeling → Evaluation → Biological Interpretation
+
+## Inputs
+
+* TCGA LUAD RNA-seq data
+* TCGA LUAD DNA methylation data
+* Clinical metadata
+
+## Outputs
+
+* Matched multi-omics sample set
+* Filtered expression matrix
+* Filtered methylation matrix
+* Stratified training and test datasets
+
+## Authors
+
+Developed as part of a collaborative academic project at Freie Universität Berlin.
+
 
 # Section 1: Data and Integration Steps
 
