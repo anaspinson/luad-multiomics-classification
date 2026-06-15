@@ -71,9 +71,8 @@ TCGA LUAD DATA
 ├── DNA Methylation (TCGAbiolinks)
 └── Clinical Labels (curatedTCGAData)
 
-```
-            ↓
-```
+            │ 
+            ▼
 
 DATA PREPROCESSING
 
