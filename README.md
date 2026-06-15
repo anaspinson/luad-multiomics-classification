@@ -12,6 +12,14 @@ The resulting models achieved high predictive performance on independent test da
 
 ---
 
+## Project Objective
+
+The objective of this project was to investigate whether integrated transcriptomic (RNA-seq) and epigenomic (DNA methylation) data could be used to accurately classify molecular subtypes of Lung Adenocarcinoma (LUAD).
+
+To achieve this, a complete multi-omics machine learning pipeline was developed, including data acquisition, preprocessing, feature engineering, statistical analysis, predictive modeling, and biological interpretation.
+
+---
+
 ## Project Highlights
 
 - Integrated RNA-seq, DNA methylation and clinical data
@@ -171,7 +179,7 @@ luad-multiomics-classification/
 │   Project overview, workflow, results and instructions
 │
 ├── ABOUT_THE_PROJECT.md
-│   Project background, contributions and lessons learned
+│   Project background, individual contributions and lessons learned
 │
 ├── docs/
 │   ├── README.md
@@ -184,18 +192,12 @@ luad-multiomics-classification/
 │   ├── 03_model_testing_and_evaluation.Rmd
 │   └── 04_biological_annotation.Rmd
 │
-├── figures/
-│   ├── README.md
-│   └── project_figures
-│
-├── results/
-│   ├── README.md
-│   └── analysis_outputs
-│
-└── environment/
+└── figures/
     ├── README.md
-    └── session_info.txt
-
+    ├── pca_subtypes.jpg
+    ├── sample_intersection.jpg
+    ├── multiclass_RF_confusion_matrix.jpg
+    └── top_overlapping_genes.jpg
 ```
 
 ---
@@ -261,9 +263,24 @@ These results demonstrate the potential of combining transcriptomic and epigenom
 
 ---
 
+## Key Learnings
+
+Through this project I gained practical experience in:
+
+* Integrating transcriptomic, methylation, and clinical datasets from multiple sources
+* Building reproducible bioinformatics workflows in R
+* Applying differential expression and differential methylation analyses for feature selection
+* Developing and evaluating machine learning models for biological classification tasks
+* Working with high-dimensional omics datasets in a high-performance computing environment
+* Interpreting predictive features through pathway and functional enrichment analyses
+
+One of the most valuable lessons from this project was the importance of robust data preprocessing and integration. Matching samples across omics layers and ensuring data quality had a substantial impact on downstream model performance and biological interpretability.
+
+---
+
 ## Academic Context
 
-This project was developed as part of the Data Science in the Life Sciences course at Freie Universität Berlin and extended into a complete multi-omics machine learning workflow for lung adenocarcinoma subtype classification.
+This project was originally developed as part of the Data Science in the Life Sciences program at Freie Universität Berlin and subsequently refined into a reproducible multi-omics machine learning workflow for lung adenocarcinoma subtype classification.
 
 ---
 
