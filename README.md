@@ -79,8 +79,6 @@ Biological Annotation
 
 ## Repository Structure
 
-## Repository Structure
-
 ```text
 luad-multiomics-classification/
 │
@@ -112,6 +110,8 @@ luad-multiomics-classification/
 └── environment/
     ├── README.md
     └── session_info.txt
+
+```
 
 This shows the complete repository.
 
