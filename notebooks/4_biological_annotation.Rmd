@@ -1,0 +1,304 @@
+---
+title: "4: LUAD Annotation"
+output: html_notebook
+---
+
+# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+
+## Data Science in the Life Sciences S25 - Final Project
+
+### Group 5
+
+**Silvia Cambiago\
+Sofiia Hoian\
+Ana Belen Solis Pinson**
+
+In the annotation part of the project we want to link machine learning features and differentially regulated genes to biological meaning.
+
+In order to do so, we:
+
+1)  Convert gene IDs to a standard format (Entrez) to make them usable in enrichment tools.
+2)  Use databases like GO, KEGG, Reactome, and Disease Ontology to find biological processes, pathways, and diseases related to these genes.
+3)  Make plots that show the most enriched biological functions.
+4)  Compare genes from different sources (DEG, DMP, Random Forest, SVM) to find overlaps.
+5)  Save all plots and overlapping genes for further interpretation.
+
+## Setup
+
+```{r output-directory, message=FALSE, warning=FALSE}
+results_base_dir <- "/Users/mac/Desktop/results_LUAD_5"
+dir.create(results_base_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load required libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+
+# Install Bioconductor if needed 
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+
+# Bioconductor packages
+# BiocManager::install(c(
+#   "clusterProfiler", "ReactomePA", "DOSE", "org.Hs.eg.db", "AnnotationDbi"
+# ))
+
+# CRAN packages
+# install.packages(c("tidyverse", "ggvenn", "ggplot2", "dplyr", "readr"))
+
+library(tidyverse)      # data manipulation and visualization 
+library(AnnotationDbi)  # base tools for annotation databases
+library(org.Hs.eg.db)   # human gene annotation database 
+library(clusterProfiler) # functional enrichment analysis (GO, KEGG, DO)
+library(enrichplot)     # visualization of enrichment results
+library(ReactomePA)     # pathway enrichment using Reactome database
+library(DOSE)           # disease ontology enrichment analysis
+library(ggvenn)         # Venn diagrams based on ggplot2
+
+```
+
+## Define Comparisons List
+
+```{r comparisons-list, message=FALSE, warning=FALSE}
+
+# This section defines a list of all pairwise comparisons to be analyzed.
+# Each comparison includes:
+# - name: a label for the comparison (used for folder names and output)
+# - deg: path to CSV file with differentially expressed genes (DEGs)
+# - dmp: path to CSV file with differentially methylated positions (DMPs)
+# - rf: path to CSV file with top features from the Random Forest classifier
+# - svm: path to CSV file with top features from the Support Vector Machine classifier
+comparisons <- list(
+  list(
+    name = "TRU_vs_proxInflam",
+    deg  = "/Users/mac/Desktop/data_science_project/luad_pi_vs_tru/luad_pi_vs_tru_prox_-inflam_vs_TRU_DEG_filtered.csv",
+    dmp  = "/Users/mac/Downloads/DMP_TRU_vs_proxInflam.csv",
+    rf   = "/Users/mac/Downloads/important_features_TRU_vs_proxInflam_RF_new.csv",
+    svm  = "/Users/mac/Downloads/feature_importance_TRU_vs_proxInflam_SVM_new.csv"
+  ),
+  list(
+    name = "TRU_vs_proxProlif",
+    deg  = "/Users/mac/Desktop/data_science_project/luad_pp_vs_tru/luad_pp_vs_tru_prox_-prolif__vs_TRU_DEG_filtered.csv",
+    dmp  = "/Users/mac/Downloads/DMP_TRU_vs_proxProlif.csv",
+    rf   = "/Users/mac/Downloads/important_features_TRU_vs_proxProlif_RF_new.csv",
+    svm  = "/Users/mac/Downloads/feature_importance_TRU_vs_proxProlif_SVM_new.csv"
+  ),
+  list(
+    name = "proxInflam_vs_proxProlif",
+    deg  = "/Users/mac/Desktop/data_science_project/luad_pi_vs_pp/luad_pi_vs_pp_prox_-inflam_vs_prox_-prolif__DEG_filtered.csv",
+    dmp  = "/Users/mac/Downloads/DMP_proxProlif_vs_proxInflam.csv",
+    rf   = "/Users/mac/Downloads/important_features_proxProlif_vs_proxInflam_RF_new.csv",
+    svm  = "/Users/mac/Downloads/feature_importance_proxProlif_vs_proxInflam_SVM_new.csv"
+  )
+)
+
+```
+
+## Save Plot Function
+
+```{r save-plot, message=FALSE, warning=FALSE}
+
+# This function will hepl to save any ggplot or compatible plot as a high-resolution PNG file
+# - filename: output file path
+# - plot_expr: the plot expression or object to be printed
+
+save_plot <- function(filename, plot_expr, width = 10, height = 6) {
+  png(filename, width = width, height = height, units = "in", res = 300)
+  print(plot_expr)
+  dev.off()
+}
+
+```
+
+## Safe Gene ID Mapping
+
+```{r safe-map, message=FALSE, warning=FALSE}
+
+# Function to safely convert gene identifiers between formats
+# - genes: vector of input gene IDs
+# - from: source ID type ("ENSEMBL", "SYMBOL")
+# - to: target ID type ("ENTREZID")
+# It filters only valid IDs and removes NA values after mapping.
+
+safe_map <- function(genes, from, to) {
+  valid_genes <- genes[genes %in% keys(org.Hs.eg.db, keytype = from)]
+  if (length(valid_genes) == 0) return(character(0))
+  res <- mapIds(org.Hs.eg.db, keys = valid_genes, column = to, keytype = from, multiVals = "first")
+  na.omit(res)
+}
+
+```
+
+## Annotation
+
+```{r annotation-function, message=FALSE, warning=FALSE}
+
+# Here we will perform enrichment analysis for different data types and save the plots and overlap statistics for each comparison
+
+run_annotation_analysis <- function(deg_df, dmp_df, rf_df, svm_df, out_dir, comparison_name) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# DEG analysis
+# Cleaning gene identifiers (by removing version suffixes), droping duplicates, converting ENSEMBL to ENTREZID and performing GO, KEGG, Reactome, DO enrichment
+  
+  deg_df$gene <- gsub("\\..*", "", deg_df$gene)
+  deg_df <- deg_df[!duplicated(deg_df$gene), ]
+  entrez_deg <- safe_map(deg_df$gene, "ENSEMBL", "ENTREZID")
+  if (length(entrez_deg) >= 10) {
+    save_plot(file.path(out_dir, "DEG_GO.png"), dotplot(enrichGO(entrez_deg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "DEG_Reactome.png"), dotplot(enrichPathway(entrez_deg, organism = "human", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "DEG_KEGG.png"), dotplot(enrichKEGG(entrez_deg, organism = "hsa", pvalueCutoff = 0.05), showCategory = 10))
+    save_plot(file.path(out_dir, "DEG_DO.png"), barplot(enrichDO(entrez_deg, ont = "DO", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+  }
+  
+# DMP analysis
+# Filtering and deduplicating SYMBOLs from DMPs, maping to ENTREZID and runing functional enrichment
+  
+  dmp_df <- dmp_df[!is.na(dmp_df$gene_HGNC) & dmp_df$gene_HGNC != "", ]
+  dmp_df <- dmp_df[!duplicated(dmp_df$gene_HGNC), ]
+  entrez_dmp <- safe_map(dmp_df$gene_HGNC, "SYMBOL", "ENTREZID")
+  if (length(entrez_dmp) >= 10) {
+    save_plot(file.path(out_dir, "DMP_GO.png"), dotplot(enrichGO(entrez_dmp, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "DMP_Reactome.png"), dotplot(enrichPathway(entrez_dmp, organism = "human", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "DMP_KEGG.png"), dotplot(enrichKEGG(entrez_dmp, organism = "hsa", pvalueCutoff = 0.05), showCategory = 10))
+    save_plot(file.path(out_dir, "DMP_DO.png"), barplot(enrichDO(entrez_dmp, ont = "DO", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+  }
+
+# Random Forest analysis
+# Extracting gene names from feature column, scaling importance, maping to ENTREZID and runing enrichment
+  
+  rf_df <- rf_df %>%
+    mutate(gene = gsub("^(expr_|meth_)", "", feature)) %>%
+    mutate(scaled_importance = importance / max(importance))
+  entrez_rf <- safe_map(rf_df$gene, "SYMBOL", "ENTREZID")
+  if (length(entrez_rf) >= 10) {
+    save_plot(file.path(out_dir, "RF_GO.png"), dotplot(enrichGO(entrez_rf, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.1, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "RF_Reactome.png"), dotplot(enrichPathway(entrez_rf, organism = "human", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "RF_KEGG.png"), dotplot(enrichKEGG(entrez_rf, organism = "hsa", pvalueCutoff = 0.05), showCategory = 10))
+    save_plot(file.path(out_dir, "RF_DO.png"), barplot(enrichDO(entrez_rf, ont = "DO", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+  }
+  
+# SVM analysis
+# Same idea here: extracting gene names from feature column, scaling importance, maping to ENTREZID and runing enrichment
+
+  svm_df <- svm_df %>%
+    mutate(gene = gsub("^(expr_|meth_)", "", Feature)) %>%
+    mutate(scaled_importance = Importance / max(Importance))
+  entrez_svm <- safe_map(svm_df$gene, "SYMBOL", "ENTREZID")
+  if (length(entrez_svm) >= 10) {
+    save_plot(file.path(out_dir, "SVM_GO.png"), dotplot(enrichGO(entrez_svm, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.1, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "SVM_Reactome.png"), dotplot(enrichPathway(entrez_svm, organism = "human", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+    save_plot(file.path(out_dir, "SVM_KEGG.png"), dotplot(enrichKEGG(entrez_svm, organism = "hsa", pvalueCutoff = 0.05), showCategory = 10))
+    save_plot(file.path(out_dir, "SVM_DO.png"), barplot(enrichDO(entrez_svm, ont = "DO", pvalueCutoff = 0.05, readable = TRUE), showCategory = 10))
+  }
+
+# Overlap and Venn diagram
+# Collecting all unique gene names and plotting Venn diagram to chech wheather features are overlaping
+  
+  overlap_genes <- list(
+    DEG = unique(deg_df$gene),
+    DMP = unique(dmp_df$gene_HGNC),
+    RF  = unique(rf_df$gene),
+    SVM = unique(svm_df$gene)
+  )
+
+  venn_plot <- ggvenn(overlap_genes, fill_color = c("red", "blue", "green", "purple"))
+  save_plot(file.path(out_dir, "Venn_All.png"), venn_plot, 8, 8)
+  
+# Saving intersecting genes to text files
+  writeLines(Reduce(intersect, overlap_genes), file.path(out_dir, "Common_All.txt"))
+  writeLines(intersect(overlap_genes$RF, overlap_genes$SVM), file.path(out_dir, "Common_RF_SVM.txt"))
+  writeLines(intersect(overlap_genes$DEG, overlap_genes$RF), file.path(out_dir, "Common_DEG_RF.txt"))
+  writeLines(intersect(overlap_genes$DMP, overlap_genes$DEG), file.path(out_dir, "Common_DMP_DEG.txt"))
+}
+
+```
+
+## Run Pairwise Annotations 
+
+```{r run-annotations, message=FALSE, warning=FALSE}
+
+# Here we make a loop that iterates over all pairwise comparisons defined in the `comparisons` list
+# For each comparison it:
+# - Reads DEG, DMP, RF, and SVM CSV files into data frames
+# - Creates a dedicated output folder
+# - Runs enrichment analysis and saves all plots and overlap files
+
+# The main function being called is `run_annotation_analysis()`
+
+for (comp in comparisons) {
+  run_annotation_analysis(
+    deg_df = read.csv(comp$deg),
+    dmp_df = read.csv(comp$dmp),
+    rf_df  = read.csv(comp$rf),
+    svm_df = read.csv(comp$svm),
+    out_dir = file.path(results_base_dir, comp$name),
+    comparison_name = comp$name
+  )
+}
+
+```
+
+## Multiclass RF and SVM Analysis
+
+```{r multiclass-analysis, message=FALSE, warning=FALSE}
+
+# In this section we analyze features selected by RF and SVM models across all subtypes (multiclass).
+# We want to identify overlapping genes, perfors functional enrichment and visualization of shared importance
+
+# Read and preprocess Random Forest results 
+# Removing prefixes (expr_/meth_) and scale importance
+
+multi_rf <- read.csv("/Users/mac/Downloads/important_features_union_Subtype_Intersected_Genes_RF_multi.csv") %>%
+  mutate(gene = gsub("^(expr_|meth_)", "", feature)) %>%
+  mutate(scaled_importance = MeanDecreaseAccuracy / max(MeanDecreaseAccuracy))
+
+# Read and preprocess SVM results 
+# Removing prefixes (expr_/meth_) and scale importance
+
+multi_svm <- read.csv("/Users/mac/Downloads/feature_importance_union_Subtype_Intersected_Genes_SVM_multi.csv") %>%
+  mutate(gene = gsub("^(expr_|meth_)", "", Feature)) %>%
+  mutate(scaled_importance = Importance / max(Importance))
+
+# Identify overlapping genes between RF and SVM 
+
+multi_overlap_genes <- intersect(multi_rf$gene, multi_svm$gene)
+writeLines(multi_overlap_genes, file.path(results_base_dir, "Multiclass_Common_RF_SVM.txt"))
+
+# Draw a Venn diagram of shared features
+venn_multi <- ggvenn(list(Multi_RF = multi_rf$gene, Multi_SVM = multi_svm$gene), fill_color = c("orange", "skyblue"))
+save_plot(file.path(results_base_dir, "Venn_Multiclass_RF_SVM.png"), venn_multi, 7, 7)
+
+# Enrichment analysis on overlapping genes
+entrez_multi <- safe_map(multi_overlap_genes, "SYMBOL", "ENTREZID")
+if (length(entrez_multi) >= 10) {
+  save_plot(file.path(results_base_dir, "Multiclass_Overlap_GO.png"), dotplot(enrichGO(entrez_multi, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.1, readable = TRUE), showCategory = 10))
+  save_plot(file.path(results_base_dir, "Multiclass_Overlap_Reactome.png"), dotplot(enrichPathway(entrez_multi, organism = "human", pvalueCutoff = 0.1, readable = TRUE), showCategory = 10))
+  save_plot(file.path(results_base_dir, "Multiclass_Overlap_KEGG.png"), dotplot(enrichKEGG(entrez_multi, organism = "hsa", pvalueCutoff = 0.05), showCategory = 10))
+}
+
+# Combine and rank gene importance from both models 
+
+importance_df <- full_join(
+  multi_rf %>% filter(gene %in% multi_overlap_genes) %>% select(gene, MeanDecreaseAccuracy),
+  multi_svm %>% filter(gene %in% multi_overlap_genes) %>% select(gene, Importance),
+  by = "gene"
+) %>% mutate(total = MeanDecreaseAccuracy + Importance) %>%
+  arrange(desc(total))
+
+write.csv(importance_df, file.path(results_base_dir, "Multiclass_Overlap_RF_SVM_Importance.csv"), row.names = FALSE)
+
+# Select top overlapping genes and visualize their combined importance 
+
+top_overlap <- importance_df %>% slice_max(order_by = total, n = 20)
+
+bar_plot <- ggplot(top_overlap, aes(x = reorder(gene, total), y = total)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Overlapping Genes by RF + SVM Importance",
+       y = "Combined Importance", x = "Gene") +
+  theme_minimal()
+
+save_plot(file.path(results_base_dir, "Multiclass_Overlap_Importance_Barplot.png"), bar_plot, 7, 6)
+
+```
