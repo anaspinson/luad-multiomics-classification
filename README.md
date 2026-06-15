@@ -64,6 +64,23 @@ To achieve this, a complete multi-omics machine learning pipeline was developed,
 
 ## Workflow
 
+## Workflow
+
+The project integrates transcriptomic, epigenomic, and clinical data from TCGA LUAD samples to identify biologically relevant features and develop machine learning models capable of classifying molecular subtypes of lung adenocarcinoma.
+
+The workflow combines bioinformatics preprocessing, multi-omics integration, statistical feature selection, machine learning, and biological interpretation into a single end-to-end pipeline.
+
+![LUAD Multi-Omics Workflow](figures/multiomics_pipeline_workflow.png)
+
+### Workflow Overview
+
+1. Acquisition of RNA-seq, DNA methylation, and clinical data from TCGA.
+2. Quality control, preprocessing, and harmonization of datasets.
+3. Integration of transcriptomic and epigenomic data through sample matching.
+4. Differential expression and differential methylation analyses for feature selection.
+5. Training of Random Forest and Support Vector Machine classifiers.
+6. Evaluation of predictive performance using independent test data.
+7. Biological interpretation through feature importance and pathway enrichment analyses.
 
 ---
 
