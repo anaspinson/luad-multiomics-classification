@@ -1,0 +1,1148 @@
+---
+title: "1: TCGA LUAD Data Download & Integration Steps"
+output:
+  html_document:
+    df_print: paged
+---
+
+# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+
+## Data Science in the Life Sciences S25 - Final Project
+
+### Group 5
+
+**Silvia Cambiago\
+Sofiia Hoian\
+Ana Belen Solis Pinson**
+
+# Section 1: Data and Integration Steps
+
+Our final project focused on working with the TCGA LUAD (Lung Adenocarcinoma) RNA-Seq, Methylation and Clinical data. This R Notebook contains the code corresponding to the following steps of the omics data analysis cycle:
+
+1.  **Data**
+
+    a\. Download (RNA-Seq, Clinical Data & Methylation)
+
+    b\. Exploration
+
+    c\. Preprocessing
+
+2.  **Integration**
+
+    a\. Quality Control
+
+    b\. Filtering
+
+    c\. Sample Matching between Omics Datasets
+
+    d\. Stratified Split into Train-Test Datasets
+
+    e\. Data Subsetting for Downstream Pairwise Comparisons
+
+# 1.1 Setup
+
+Load required libraries.
+
+```{r setup, message=FALSE, warning=FALSE}
+
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install Bioconductor only if not already installed
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+
+# Bioconductor Packages
+#BiocManager::install(c("recount3", "SummarizedExperiment", "DESeq2", "TCGAutils", "TCGAbiolinks", "curatedTCGAData", "sesame", "sesameData", "org.Hs.eg.db"))
+
+# CRAN Packages
+#install.packages("tidyverse", "caret", "dplyr", "pheatmap", "tibble", "ggplot2", "reshape2")
+
+# Load libraries
+library(recount3) #RNA-Seq data
+library(SummarizedExperiment) #RNA-seq data manipulation
+library(tidyverse) # Data Manipulation
+library(DESeq2) #DEG
+library(caret) # Stratification
+library(dplyr) # Stratification
+library(curatedTCGAData) #Cancer subtypes and stage
+library(TCGAbiolinks) # Methylation data
+library(sesame) #Methylation
+library(sesameData) #Methylation
+library(org.Hs.eg.db) #Map to HGNC gene symbols
+
+# Visualization
+library(pheatmap)
+library(tibble)
+library(ggplot2)
+library(reshape2)
+library(VennDiagram)
+library(grid)
+
+```
+
+Set working directory. Intermediate objects will be saved in and loaded from folders created in this working location.
+
+```{r work-dir-setup}
+
+work_dir <- "/home/rstudio/data/FinalProject/LUAD Project RData/Final_Code/"
+
+# Set working directory
+setwd(work_dir)
+
+```
+
+# 1.2 RNA-Seq Data
+
+## 1.2.1 Download
+
+RNA-seq expression data download via the *recount3* package.
+
+```{r rna-data-download, message=FALSE}
+
+# Available human projects in recount3
+human_projects <- available_projects()
+
+# Filter only TCGA LUAD projects
+tcga_luad_project <- subset(human_projects, project == "LUAD" & file_source == "tcga")
+
+# Display quick view of TCGA LUAD project information
+tcga_luad_project
+
+```
+
+RangeSummarizedExperiment (RSE) object creation, this object contains raw counts and metadata.
+
+```{r rna-data-rse, message=FALSE}
+
+# Create RangedSummarizedExperiment (RSE)
+rse_tcga_luad <- create_rse(tcga_luad_project)
+
+# Display summary of TCGA LUAD RSE object information
+rse_tcga_luad
+
+```
+
+## 1.2.2 Clinical Data Download- Subtype Information
+
+Clinical data download via the *curatedTCGAData* package.
+
+```{r clin-data-download, message=FALSE}
+
+luad_curated <- curatedTCGAData(
+  "LUAD",
+  assays = "RNASeq2GeneNorm",
+  dry.run = FALSE,
+  version = "2.1.1"
+)
+
+```
+
+Match samples between RNA-Seq and Clinical Data to keep common sample set.
+
+```{r sample-match-rna-clinical}
+
+# Integrating LUAD cancer subtype data from curatedTCGAData
+
+# Get patientID from barcode from recount3 data and clinical data (both in type character)
+patient_ids_rse <- substr(rse_tcga_luad$tcga.tcga_barcode, 1, 12)
+patient_ids_curated <- luad_curated$patientID 
+
+# Use name vectors to use the patient ids
+expression_subtype <- setNames(as.character(luad_curated$expression_subtype), patient_ids_curated)
+
+# Add expression subtypes to colData from recount3, rse_tcga_luad
+colData(rse_tcga_luad)$expression_subtype <- expression_subtype[patient_ids_rse]
+
+# Make subtypes factor for downstream analysis
+colData(rse_tcga_luad)$expression_subtype <- factor(
+  colData(rse_tcga_luad)$expression_subtype,
+  levels = c("prox.-inflam", "prox.-prolif.", "TRU")
+)
+
+# Add sample type as factor column
+colData(rse_tcga_luad)$sample_type_factor <- factor(
+  rse_tcga_luad$tcga.cgc_sample_sample_type,
+  levels = c("Primary Tumor", "Solid Tissue Normal")
+)
+
+# Substitute spaces by underscores in levels to avoid downstream errors
+levels(colData(rse_tcga_luad)$sample_type_factor) <- gsub(" ", "_", levels(colData(rse_tcga_luad)$sample_type_factor))
+
+# Keep only samples with sample type info to start
+keep_samples <- !is.na(colData(rse_tcga_luad)$sample_type_factor)
+rse_sample_filtered <- rse_tcga_luad[, keep_samples]
+
+```
+
+Pathologic stage collapsing to obtain more general categories.
+
+```{r stage-collapse}
+
+# Extract raw stage
+stage_raw <- rse_sample_filtered$tcga.cgc_case_pathologic_stage
+
+# Collapse stages
+stage_collapsed <- case_when(
+  stage_raw %in% c("Stage I", "Stage IA", "Stage IB") ~ "Stage I",
+  stage_raw %in% c("Stage II", "Stage IIA", "Stage IIB")  ~ "Stage II",
+  stage_raw %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC") ~ "Stage III",
+  stage_raw == "Stage IV" ~ "Stage IV",
+  TRUE ~ NA_character_ # for any rows that do not match the other conditions, unknowns X or Tis
+)
+
+# Add to rse metadata as factor
+colData(rse_sample_filtered)$stage_collapsed <- factor(stage_collapsed,
+    levels = c("Stage I", "Stage II", "Stage III", "Stage IV"))
+
+# Substitute spaces by underscores in levels to avoid downstream errors
+levels(colData(rse_sample_filtered)$stage_collapsed) <- gsub(" ", "_", levels(colData(rse_sample_filtered)$stage_collapsed))
+
+```
+
+## 1.2.3 Data Exploration
+
+### Exploratory PCA
+
+Exploratory PCA to show the global structure of our raw data. Raw data here refers to the RNA-Seq + Subtype information dataset.
+
+#### RNA-Seq Data Normalization for PCA
+
+Data normalized using the variance stabilizing transformation function *vst* from *DESeq2*.
+
+```{r rna-raw-data-norm, message=FALSE}
+
+# To do exploratory PCA, raw expression counts need to be normalized
+# Normalize counts with vst from DESeq2
+
+# DESeq2 object creation
+dds_raw <- DESeqDataSetFromMatrix(
+    countData = assays(rse_sample_filtered)$raw_counts,
+    colData = colData(rse_sample_filtered),
+    design = ~ sample_type_factor
+)
+
+# vst normalization
+vsd_raw <- vst(dds_raw, blind = TRUE)
+
+```
+
+Exploratory sample type PCA visualisation.
+
+```{r rna-raw-data-pca-sample, message=FALSE}
+
+# PCA colored by sample, normal vs tumor
+plotPCA(vsd_raw, intgroup = "sample_type_factor") +
+  ggtitle("LUAD Raw Data PCA \n Colored by Sample Type") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Exploratory subtype PCA visualisation.
+
+```{r rna-raw-data-pca-subtype, message=FALSE}
+
+# PCA colored by cancer subtype
+plotPCA(vsd_raw, intgroup = "expression_subtype") +
+  ggtitle("LUAD Raw Data PCA \n Colored by Subtype") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Exploratory stage PCA visualisation.
+
+```{r rna-raw-data-pca-stage, message=FALSE}
+
+# PCA colored by stage
+plotPCA(vsd_raw, intgroup = "stage_collapsed") +
+  ggtitle("LUAD Raw Data PCA \n Colored by Collapsed Cancer Stage") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+#### Gene Types and Gene Counts
+
+Counts per gene, check whether any genes need to be filtered out due to low counts (noise). Visualise filter suggested by *DESeq2* authors.
+
+```{r rna-raw-genes-hist, message=FALSE, warning=FALSE}
+
+# Histogram of counts per gene
+# Sum of counts across all samples (raw, not normalized)
+gene_counts_raw <- rowSums(assay(rse_sample_filtered))
+
+ggplot(data.frame(total_counts = gene_counts_raw), aes(x = total_counts)) +
+  geom_histogram(bins = 100, fill = "#2c7fb8", color = "white") +
+  scale_x_log10() +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "red") +
+  xlab("Total Counts per Gene (log10 scale)") +
+  ylab("Number of Genes") +
+  ggtitle("Distribution of Total Counts per Gene (Before Filtering)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Visualize gene types on our data.
+
+```{r rna-raw-genes-bar, message=FALSE}
+
+# Bar plot of gene types
+
+# Gene types table
+gene_types <- rowData(rse_sample_filtered)$gene_type
+gene_type_tbl <- as.data.frame(table(gene_types)) #type and frequency
+
+# Sort top gene types
+top_types <- gene_type_tbl[order(-gene_type_tbl$Freq), ][1:15, ]  # top 10 most common
+
+# Barplot
+ggplot(top_types, aes(x = reorder(gene_types, Freq), y = Freq)) +
+  geom_bar(stat = "identity", fill = "#41ab5d") +
+  coord_flip() +
+  xlab("Gene Type") +
+  ylab("Number of Genes") +
+  ggtitle("Most Common Gene Types in RNA-seq Data") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Look into most variable genes to have an idea of how informative our genes are.
+
+```{r rna-raw-genes-heatmap}
+
+# Heatmap of most variable genes
+
+# Variance of each gene (using VST-normalized data)
+vsd_raw_mat <- assay(vsd_raw)
+gene_vars <- apply(vsd_raw_mat, 1, var)
+
+# Create annotation for subtypes (columns = samples)
+annotation_col <- data.frame(
+  Subtype = colData(vsd_raw)$expression_subtype
+)
+rownames(annotation_col) <- colnames(vsd_raw_mat)
+
+# Top 30 most variable genes
+top_var_genes <- head(order(gene_vars, decreasing = TRUE), 30)
+
+# Heatmap top 30
+pheatmap(
+  vsd_raw_mat[top_var_genes, ],
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = "Top 30 Most Variable Genes (VST Transformed)"
+)
+
+```
+
+## 1.2.4 Data Preprocessing & Filtering
+
+Preprocessing & filtering based on the data exploration observations.
+
+### Filtering by sample type
+
+```{r sample-filtering}
+
+# Filter by sample type, keep only normal and primary tumor
+sample_types <- colData(rse_sample_filtered)$sample_type_factor
+keep_samples <- sample_types %in% c("Primary_Tumor", "Solid_Tissue_Normal") & !is.na(sample_types)
+rse_luad_filtered_samples <- rse_sample_filtered[, keep_samples]
+
+```
+
+### Filtering by gene type
+
+```{r gene-filtering}
+
+# Filter by gene type, keep only protein coding genes
+keep_genes <- rowData(rse_sample_filtered)$gene_type == "protein_coding"
+rse_luad_filtered_genes <- rse_luad_filtered_samples[keep_genes, ]
+
+```
+
+### Filtering by gene counts
+
+```{r gene-counts-filtering}
+
+# Filter genes by expression counts as recommended by DESeq2 authors
+# 10 counts in at least 10 samples
+
+# Extract raw counts into an object to filter
+luad_countData<- assays(rse_luad_filtered_genes)$raw_counts
+
+# Keep genes expressed at least 10 counts in 10+ samples
+keep_genes <- rowSums(luad_countData >= 10) >= 10
+
+# Update rse object, not just the extracted countData
+# s sample, g gene type, c gene counts
+rse_luad_sgc_filtered <- rse_luad_filtered_genes[keep_genes, ]
+
+```
+
+## 1.2.5 Filtered Data Visualisation
+
+### PCA after Filtering
+
+Filtered data normalised again with *vst* from *DESeq2*
+
+```{r rna-filtered-data-norm, message=FALSE}
+
+# Intermediate rse objects with specific samples, for plotting PCA after filtering
+rse_stage_primary <- rse_luad_sgc_filtered[
+     , rse_luad_sgc_filtered$tcga.cgc_sample_sample_type == "Primary Tumor" &
+         !is.na(rse_luad_sgc_filtered$stage_collapsed)
+]
+
+rse_subtype_primary <- rse_luad_sgc_filtered[
+  , rse_luad_sgc_filtered$tcga.cgc_sample_sample_type == "Primary Tumor" &
+        !is.na(rse_luad_sgc_filtered$expression_subtype)
+]
+
+#Creating DESeq2 objects for PCA
+
+dds_sgc_filtered <- DESeqDataSetFromMatrix(
+    countData = assays(rse_luad_sgc_filtered)$raw_counts,
+    colData = colData(rse_luad_sgc_filtered),
+    design = ~ sample_type_factor
+)
+
+dds_filtered_subtype <- DESeqDataSetFromMatrix(
+  countData = assays(rse_subtype_primary)$raw_counts,
+  colData = colData(rse_subtype_primary),
+  design = ~ 1
+)
+
+dds_filtered_stage <- DESeqDataSetFromMatrix(
+  countData = assays(rse_stage_primary)$raw_counts,
+  colData = colData(rse_stage_primary),
+  design = ~ 1
+)
+
+# Use vst to stabilize counts by variance
+vsd_sgc_filtered <- vst(dds_sgc_filtered, blind = TRUE)
+vsd_filtered_stage <- vst(dds_filtered_stage, blind = TRUE)
+vsd_filtered_subtype <- vst(dds_filtered_subtype, blind = TRUE)
+
+```
+
+Filtered subtype PCA visualisation.
+
+```{r rna-filtered-data-pca-subtype, message=FALSE}
+
+# Filtered data colored by subtype
+plotPCA(vsd_filtered_subtype, intgroup = "expression_subtype") +
+  ggtitle("LUAD Filtered Data PCA \n Colored by Subtype") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Filtered stage PCA visualisation.
+
+```{r rna-filtered-data-pca-stage, message=FALSE}
+
+# Filtered data colored by stage
+plotPCA(vsd_filtered_stage, intgroup = "stage_collapsed") +
+  ggtitle("LUAD Filtered Data PCA \n Colored by Cancer Stage") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Gene count distribution after filtering, showing gene count filter line for reference.
+
+```{r rna-filtered-genes-hist, message=FALSE, warning=FALSE}
+
+# Histogram of counts per gene
+# Sum of counts across all samples (raw, not normalized)
+gene_counts_filtered <- rowSums(assay(rse_luad_sgc_filtered))
+
+ggplot(data.frame(total_counts = gene_counts_filtered), aes(x = total_counts)) +
+  geom_histogram(bins = 100, fill = "#2c7fb8", color = "white") +
+  scale_x_log10() +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "red") +
+  xlab("Total Counts per Gene (log10 scale)") +
+  ylab("Number of Genes") +
+  ggtitle("Distribution of Total Counts per Gene (After Filtering)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Heatmap of most variable genes after filtering.
+
+```{r rna-filtered-genes-heatmap}
+
+# Variance of each gene (using VST-normalized data)
+vsd_filtered_mat <- assay(vsd_sgc_filtered)
+gene_vars <- apply(vsd_filtered_mat, 1, var)
+
+# Create annotation for subtypes (columns = samples)
+annotation_col <- data.frame(
+  Subtype = colData(vsd_sgc_filtered)$expression_subtype
+)
+rownames(annotation_col) <- colnames(vsd_sgc_filtered)
+
+# Top 30 most variable genes
+top_var_genes <- head(order(gene_vars, decreasing = TRUE), 30)
+
+# Heatmap top 30
+pheatmap(
+  vsd_filtered_mat[top_var_genes, ],
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = "Filtered Data - Top 30 Most Variable Genes (VST Transformed)"
+)
+
+```
+
+## 1.2.6 Stratified Split into Train and Test Sets
+
+Global split into 80% training-20% test. The stratification will be done considering sample type, cancer subtype and tumor stage to keep the proportions as in the input filtered data.
+
+```{r stratified-split, message=FALSE, warning=FALSE}
+
+# Stratified Split based on metadata labels
+# Extract metadata into df
+luad_metadata_df <- as.data.frame(colData(rse_luad_sgc_filtered))
+
+# Copy for before split visualization
+luad_metadata_before_split_df <- luad_metadata_df
+
+# Create a composite stratification label
+# e.g., "Primary_tumor_prolif.-inflam_Stage_I", "Solid_tissue_normal_TRU_Stage_II", etc.
+
+# Create composite strata labels
+luad_metadata_df$strata <- paste(
+  luad_metadata_df$sample_type_factor,
+  luad_metadata_df$expression_subtype,
+  luad_metadata_df$stage_collapsed,
+  sep = "_"
+)
+
+# Global Stratified split using composite label, test-training
+set.seed(42)
+luad_train_ids <- createDataPartition(luad_metadata_df$strata, p = 0.8, list = FALSE)
+
+# Assign split labels
+luad_metadata_df$split <- "test"
+luad_metadata_df$split[luad_train_ids]<- "train"
+
+# Add split info into the rse ColData metadata
+colData(rse_luad_sgc_filtered)$split <- luad_metadata_df$split
+
+cat("Sample assignment after Stratified Split:")
+table(rse_luad_sgc_filtered$split)
+
+```
+
+Saving intermediate RSE objects that will be useful to skip previous processing steps and can be used downstream.
+
+```{r rna-data-save}
+
+# Create "rse_objects" folder if it does not exist
+dir.create("LUAD_rse_objects", showWarnings = FALSE)
+
+# File paths, relative to working dir
+path_filtered <- file.path("LUAD_rse_objects", "rse_luad_sgc_filtered.RData")
+path_train <- file.path("LUAD_rse_objects", "rse_luad_train.RData")
+path_test <- file.path("LUAD_rse_objects", "rse_luad_test.RData")
+
+# Saving filtered object with split, subtype and sample type info added as extra metadata factor cols
+save(rse_luad_sgc_filtered, file = path_filtered)
+
+# Create 80-20 train/test RSE objects
+rse_luad_train <- rse_luad_sgc_filtered[, colData(rse_luad_sgc_filtered)$split == "train"]
+rse_luad_test <- rse_luad_sgc_filtered[, colData(rse_luad_sgc_filtered)$split == "test"]
+
+# Extract only train primary tumor samples
+rse_luad_train_primary <- rse_luad_train[, colData(rse_luad_train)$sample_type_factor == "Primary_Tumor"]
+
+# Save train/test objects
+save(rse_luad_train, file = path_train)
+save(rse_luad_test, file = path_test)
+```
+
+### Visualisation Before Split
+
+Visualising proportions of subtype and stage samples in filtered data before stratified split.
+
+```{r before-stratification-plot-subtype}
+
+# Stratification breakdown plots, before and after
+
+# Before split subtype proportions
+ggplot(subset(luad_metadata_before_split_df, !is.na(expression_subtype)), 
+       aes(x = expression_subtype)) +
+  geom_bar(fill = "orchid") +
+  labs(title = "Subtype Distribution Before Stratified Split", 
+       x = "Subtype", y = "Sample Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r before-stratification-plot-stage}
+
+# Before split stage proportions
+ggplot(subset(luad_metadata_before_split_df, !is.na(stage_collapsed)), 
+       aes(x = stage_collapsed)) +
+  geom_bar(fill = "cadetblue3") +
+  labs(title = "Stage Distribution Before Stratified Split", 
+       x = "Stage", y = "Sample Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+### Visualisation after Stratified Split
+
+Visualizing proportions of subtype and stage samples in data after stratified split.
+
+```{r after-stratification-plot-subtype}
+
+# After split subtype proportions
+# Filter metadata to samples with subtype info
+subtype_meta <- subset(luad_metadata_df, !is.na(expression_subtype))
+
+ggplot(subtype_meta, aes(x = expression_subtype, fill = split)) +
+  geom_bar(position = "stack") +
+  scale_fill_manual(values = c("train" = "orchid4", "test" = "plum2")) +
+  labs(title = "Subtype Distribution by Split (Filtered)", x = "Subtype", y = "Sample Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r after-stratification-plot-stage}
+
+# After split stage proportions
+stage_meta <- subset(luad_metadata_df, !is.na(stage_collapsed))
+
+ggplot(stage_meta, aes(x = stage_collapsed, fill = split)) +
+  geom_bar(position = "stack") +
+  scale_fill_manual(values = c("train" = "cadetblue", "test" = "lightblue")) +
+  labs(title = "Stage Distribution by Split (Filtered)", x = "Stage", y = "Sample Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+## 1.2.7 Pairwise Comparison Data Subsets
+
+Subsetting data for pairwise comparisons, subtype and stage pairs. Pair subsets will be saved in an RSE object.
+
+```{r subset-pair-rse}
+# Helper function to get samples for each comparison
+subset_rse <- function(rse, filter_expr) {
+  meta <- as.data.frame(colData(rse))
+  subset_idx <- which(eval(parse(text = filter_expr), envir = meta))
+  rse[, subset_idx]
+}
+
+# Helper function to subset and save rse
+subset_and_save_rse <- function(rse, condition, name, outdir = "rse_objects") {
+  message("Creating: ", name)
+  subset <- subset_rse(rse, condition)
+  cat("    Samples:", ncol(subset), "| Genes:", nrow(subset), "\n")
+  # Save with object name as in environment, useful when loading back
+  assign(name, subset, envir = .GlobalEnv)
+  save(list = name, file = file.path(outdir, paste0(name, ".RData")))
+}
+
+# Define subtype comparisons
+subtype_comparisons <- list(
+  rse_luad_pi_vs_pp = 'sample_type_factor == "Primary_Tumor" & expression_subtype %in% c("prox.-inflam", "prox.-prolif.")',
+  rse_luad_pi_vs_tru = 'sample_type_factor == "Primary_Tumor" & expression_subtype %in% c("prox.-inflam", "TRU")',
+  rse_luad_pp_vs_tru = 'sample_type_factor == "Primary_Tumor" & expression_subtype %in% c("prox.-prolif.", "TRU")'
+)
+
+# Define stage comparisons
+stage_comparisons <- list(
+  rse_luad_stage1_vs_2 = 'sample_type_factor == "Primary_Tumor" & stage_collapsed %in% c("Stage_I", "Stage_II")',
+  rse_luad_stage1_vs_3 = 'sample_type_factor == "Primary_Tumor" & stage_collapsed %in% c("Stage_I", "Stage_III")',
+  rse_luad_stage1_vs_4 = 'sample_type_factor == "Primary_Tumor" & stage_collapsed %in% c("Stage_I", "Stage_IV")',
+  rse_luad_stage2_vs_3 = 'sample_type_factor == "Primary_Tumor" & stage_collapsed %in% c("Stage_II", "Stage_III")',
+  rse_luad_stage2_vs_4 = 'sample_type_factor == "Primary_Tumor" & stage_collapsed %in% c("Stage_II", "Stage_IV")',
+  rse_luad_stage3_vs_4 = 'sample_type_factor == "Primary_Tumor" & stage_collapsed %in% c("Stage_III", "Stage_IV")'
+)
+
+# Subset and save subtype comparison rse objects
+for (name in names(subtype_comparisons)) {
+  subset_and_save_rse(rse_luad_train, subtype_comparisons[[name]], name)
+}
+
+# Subset and save stage comparison rse objects
+for (name in names(stage_comparisons)) {
+  subset_and_save_rse(rse_luad_train, stage_comparisons[[name]], name)
+}
+```
+
+### Pairwise Comparisons Visualisation
+
+Heatmap to visualize samples that went into each pairwise comparison.
+
+```{r train-primary-metadata-processing}
+
+# Processing train primary tumor samples data to generate heatmaps
+
+# Extract metadata
+train_meta <- as.data.frame(colData(rse_luad_train_primary))
+
+# Helper function to get counts for each pair
+get_pair_counts <- function(df, variable, group1, group2, label) {
+  df_filtered <- df %>%
+    filter(!is.na(.data[[variable]])) %>%
+    filter(.data[[variable]] %in% c(group1, group2))
+  tibble(
+    Comparison = label,
+    Group = c(group1, group2),
+    Count = c(
+      sum(df_filtered[[variable]] == group1),
+      sum(df_filtered[[variable]] == group2)
+    )
+  )
+}
+
+# Subtype comparisons counts table
+subtype_counts <- bind_rows(
+  get_pair_counts(train_meta, "expression_subtype", "prox.-inflam", "prox.-prolif.", "proxInflam vs proxProlif"),
+  get_pair_counts(train_meta, "expression_subtype", "TRU", "prox.-prolif.", "TRU vs proxProlif"),
+  get_pair_counts(train_meta, "expression_subtype", "TRU", "prox.-inflam", "TRU vs proxInflam")
+)
+
+# Stage comparisons counts table
+stage_counts <- bind_rows(
+  get_pair_counts(train_meta, "stage_collapsed", "Stage_I", "Stage_II", "Stage I vs II"),
+  get_pair_counts(train_meta, "stage_collapsed", "Stage_I", "Stage_III", "Stage I vs III"),
+  get_pair_counts(train_meta, "stage_collapsed", "Stage_I", "Stage_IV", "Stage I vs IV"),
+  get_pair_counts(train_meta, "stage_collapsed", "Stage_II", "Stage_III", "Stage II vs III"),
+  get_pair_counts(train_meta, "stage_collapsed", "Stage_II", "Stage_IV", "Stage II vs IV"),
+  get_pair_counts(train_meta, "stage_collapsed", "Stage_III", "Stage_IV", "Stage III vs IV")
+)
+
+```
+
+#### Subtype Comparisons Heatmap
+
+```{r rna-pairwise-comp-heatmap-subtype}
+
+# Subtype pairwise subset samples
+ggplot(subtype_counts, aes(x = Comparison, y = Group, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "black", size = 3.5) +
+  scale_fill_gradient(low = "#e0f3f8", high = "#08589e") +
+  theme_minimal() +
+  labs(title = "Samples per Group in Subtype Comparisons",
+       x = "Comparison", y = "Subtype") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+#### Stage Comparisons Heatmap
+
+```{r rna-pairwise-comp-heatmap-stage}
+
+# Subtype pairwise subset samples
+ggplot(stage_counts, aes(x = Comparison, y = Group, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "black", size = 3.5) +
+  scale_fill_gradient(low = "#fee0d2", high = "#de2d26") +
+  theme_minimal() +
+  labs(title = "Samples per Group in Stage Comparisons",
+       x = "Comparison", y = "Stage") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+# 1.3 Methylation Data
+
+Methylation data β values downloaded via the *TCGAbiolinks* package.
+
+**NOTE:** Methylation data file download & consolidation takes about 1 hour to complete so we offer two options to proceed:\
+\
+**Option A**: Full download and consolidation of the downloaded files into a single SummarizedExperiment object (LUAD_methylation_SE.rda file), used to continue the analysis.\
+\
+**Option B**: For practicality, we provide the LUAD_methylation_SE.rda file that was processed through the Option A code. If needed due to time or memory constraints, the {met-data-download} and {met-data-se} code chunks can be skipped and substituted by the {met-data-se-load}, to load the provided file.
+
+## 1.3.1 Option A: Download & SE Consolidation
+
+```{r met-data-download}
+
+# Define download directory
+download_dir <- "LUAD_met_data_files"
+if (!dir.exists(download_dir)) dir.create(download_dir)
+
+# Build the query
+luad_query_met <- GDCquery(
+  project = "TCGA-LUAD",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform  = "Illumina Human Methylation 450"
+)
+
+# Download in batches, each time into download_dir
+files <- getResults(luad_query_met)
+total_files <- nrow(files)
+batch_size <- 50
+
+for (start in seq(1, total_files, by = batch_size)) {
+  end <- min(start + batch_size - 1, total_files)
+  batch_query <- luad_query_met
+  batch_query$results[[1]] <- files[start:end, ]
+
+  cat(sprintf("Downloading batch %d to %d...\n", start, end))
+  
+  tryCatch({
+    GDCdownload(batch_query, directory = download_dir, method = "api")
+
+    # Check that the files exist after download
+    batch_files <- getResults(batch_query)$file_name
+    missing <- !file.exists(file.path(download_dir, batch_files))
+
+    if (any(missing)) {
+      cat("Missing files in batch, re-trying...\n")
+      GDCdownload(batch_query, directory = download_dir, method = "api")
+    }
+    
+  }, error = function(e) {
+    message(sprintf("Failed batch %d–%d: %s", start, end, e$message))
+  })
+}
+
+```
+
+Methylation data consolidation into SummarizedExperiment object. Memory intensive process, at least 32GB RAM recommended.
+
+```{r met-data-se}
+
+# Prepare the methylation SummarizedExperiment from download_dir files
+luad_met <- GDCprepare(
+  query = luad_query_met,
+  directory = download_dir,
+)
+
+# Explicitly save as luad_met, otherwise the object is named data
+save(luad_met, file = file.path(download_dir, "LUAD_methylation_SE.rda"))
+
+```
+
+## 1.3.1 Option B: LUAD Methylation Data file loading shortcut
+
+Load provided LUAD methylation data SE file to skip download & consolidation steps.
+
+```{r met-data-se-load}
+
+# Specify folder where SE file is
+download_dir <- "LUAD_met_data_files"
+
+# Construct full relative path
+luad_met_path <- file.path(download_dir, "LUAD_methylation_SE.rda")
+
+# Load the saved SummarizedExperiment object
+load(luad_met_path)
+
+```
+
+## 1.3.2 Data Exploration, Preprocessing & Filtering
+
+### **Methylation Probe Quality Control**
+
+Visualise the number of probes flagged by each MASK category, masks are useful for quality control. MASK_general is a comprehensive summary of all other bad-quality flags.
+
+```{r probe-masks-plot}
+
+# Extract all MASK_* columns
+mask_cols <- grep("^MASK_", colnames(rowData(luad_met)), value = TRUE)
+
+# Count how many probes are flagged TRUE in each column
+mask_counts <- sapply(mask_cols, function(col) {
+  sum(rowData(luad_met)[[col]] == TRUE, na.rm = TRUE)
+})
+
+# Create data frame for plotting
+mask_df <- data.frame(
+  Mask_Type = names(mask_counts),
+  Num_Probes = as.numeric(mask_counts)
+)
+
+# Add a column to mark general mask
+mask_df$Highlight <- ifelse(mask_df$Mask_Type == "MASK_general", "General", "Other")
+
+# Clean labels for plot
+mask_df$Mask_Label <- gsub("^MASK_", "", mask_df$Mask_Type)
+mask_df$Mask_Label <- gsub("_", " ", mask_df$Mask_Label)
+
+# Order for plotting
+mask_df <- mask_df[order(mask_df$Num_Probes, decreasing = TRUE), ]
+mask_df$Mask_Label <- factor(mask_df$Mask_Label, levels = rev(mask_df$Mask_Label))
+
+# Plot with general mask in red
+ggplot(mask_df, aes(x = Mask_Label, y = Num_Probes, fill = Highlight)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("General" = "red", "Other" = "#377eb8")) +
+  labs(
+    title = "Number of Probes Flagged by Each MASK Category",
+    x = "MASK Type",
+    y = "Number of Flagged Probes"
+    # fill = "Category"  # Removed this line
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+```
+
+#### **Filter out bad quality probes**
+
+```{r bad-probe-filter}
+
+# Filter out MASK_general == TRUE probes, bad quality
+luad_met_filtered <- luad_met[!rowData(luad_met)$MASK_general %in% TRUE, ]
+
+# Save luad_met_filtered object for future use
+
+# File path, relative to working dir
+path_luad_met_filtered <- file.path("LUAD_met_data_files", "luad_met_filtered.RData")
+save(luad_met_filtered, file = path_luad_met_filtered)
+
+```
+
+#### Filtered probe data β values distribution
+
+Distribution of β values after filtering out bad quality probes to verify quality. β values will be transformed in to M-values for downstream analysis.
+
+```{r beta-meta-extract}
+
+# Extract β-matrix and metadata from filtered SE object
+beta_mat  <- assay(luad_met_filtered)
+meta_meth <- as.data.frame(colData(luad_met_filtered))
+
+```
+
+```{r filtered-beta-value-dist}
+
+# Methylation profile distribution after bad quality probe filtering & pre-sample matching with RNA-seq
+plot(density(beta_mat[,1], na.rm = TRUE), 
+     col = "grey", main = "Beta Value Distribution", xlab = "Beta", lwd = 2)
+for (i in 2:10) {
+  lines(density(beta_mat[,i], na.rm = TRUE), col = "grey")
+}
+
+```
+
+### Sample matching with RNA-Seq Train dataset
+
+Using TCGA barcodes from methylation data metadata.
+
+```{r sample-match-met-rna}
+
+# Subset to RNA‐seq samples only
+rse_train <- rse_luad_sgc_filtered[, colData(rse_luad_sgc_filtered)$split == "train"]
+rna_ids <- substr(colData(rse_train)$tcga.cgc_sample_id, 1, 16)
+meth_ids <- substr(colnames(beta_mat), 1, 16)
+common <- intersect(rna_ids, meth_ids)
+
+# Select only common samples of type Primary_Tumor
+primary_tumor_met_samples <- meta_meth$sample[meta_meth$sample_type == "Primary Tumor"]
+
+# Intersect RNA-matched methylation samples with Primary_Tumor samples only
+common_primary <- intersect(common, primary_tumor_met_samples)
+
+# Align and subset the β‐matrix with only common primary tumor samples
+idx_beta <- match(common_primary, meth_ids)
+beta_sub <- beta_mat[, idx_beta]
+
+# Filter RNA-seq rse_train to keep only matching primary tumor samples
+rna_ids_primary <- match(common_primary, rse_train$tcga.cgc_sample_id)
+rse_train_primary <- rse_train[, rna_ids_primary]
+
+# Save rse_train_primary & common_primary samples 
+
+# File path, relative to working dir
+path_train_primary <- file.path("LUAD_rse_objects", "rse_train_primary.RData")
+save(rse_train_primary, file = path_train_primary)
+
+path_common_primary <- file.path("LUAD_rse_objects", "common_primary.RData")
+save(common_primary, file = path_common_primary)
+
+```
+
+Venn Diagram to visualise methylation and RNA-seq sample intersection.
+
+```{r met-rna-sample-intersection-vd}
+
+# Venn Diagram using rna_ids and meth_ids
+vd <- venn.diagram(
+    x = list(
+        RNA_seq = unique(rna_ids),
+        Methylation = unique(meth_ids)
+    ),
+    filename = NULL,
+    fill = c("skyblue", "lightpink"),
+    alpha = 0.5,
+    cex = 2,
+    cat.cex = 1.5,
+    main = "Sample Overlap: RNA-seq vs Methylation"
+)
+
+grid.newpage()
+grid.draw(vd)
+
+```
+
+Visualise intersecting primary tumor samples only.
+
+```{r met-rna-tumor-sample-intersection-vd}
+
+# Intersecting only primary tumor samples
+
+# Subset RNA and methylation IDs to primary tumor samples
+rna_primary <- intersect(rna_ids, primary_tumor_met_samples)
+meth_primary <- intersect(meth_ids, primary_tumor_met_samples)
+
+# Now plot their Venn diagram
+sample_sets_primary <- list(
+  RNA_seq_primary = unique(rna_primary),
+  Methylation_primary = unique(meth_primary)
+)
+
+vd_primary <- venn.diagram(
+  x = sample_sets_primary,
+  filename = NULL,
+  fill = c("skyblue", "lightpink"),
+  alpha = 0.5,
+  cex = 2,
+  cat.cex = 1.5,
+  main = "Primary Tumor Sample Overlap: RNA-seq vs Methylation"
+)
+
+grid.newpage()
+grid.draw(vd_primary)
+
+```
+
+```{r sample-matched-beta-value-dist}
+
+# Shows methylation profile distribution after sample matching & pre-transformation to M-values.
+plot(density(beta_sub[,1], na.rm = TRUE), 
+     col = "grey", main = "Sample-Matched Beta Value Distribution", xlab = "Beta", lwd = 2)
+for (i in 2:10) {
+  lines(density(beta_sub[,i], na.rm = TRUE), col = "grey")
+}
+
+```
+
+#### β values transformation into M values
+
+```{r beta-mval-transform}
+
+# Convert beta values to M-values for downstream analysis
+percentM <- beta_sub * 100
+percentM <- pmin(pmax(percentM, 0.01), 99.99)  # clamp to avoid ±Inf
+Mval <- log2(percentM / (100 - percentM)) 
+
+```
+
+Visualisation of M-values distribution.
+
+```{r mval-dist}
+
+# M-values distribution (post-transformation)
+plot(density(Mval[,1], na.rm = TRUE), 
+     col = "grey", main = "M-value Distribution", xlab = "M-value", lwd = 2)
+for (i in 2:10) {
+  lines(density(Mval[,i], na.rm = TRUE), col = "grey")
+}
+
+```
+
+## 1.3.3 Pairwise Comparison Data Subsets Visualisation
+
+The data subsetting for the differetial methylation pairwise comparisons is done in the differential methylation section of this analysis (Data Modeling). As part of data preprocessing, here we visualise the idea behind our subsetting and insight into our sample sizes.
+
+```{r met-pairwise-comp-heatmap}
+
+# Heatmap of methylation data pairwise comparisons
+
+# Get sample counts for subtypes and stages from rse
+subtype_counts <- table(rse_train_primary$expression_subtype)
+stage_counts <- table(rse_train_primary$stage_collapsed)
+
+# Define pairwise comparisons
+pairwise_meth <- tribble(
+  ~Comparison,           ~Group1,        ~Group2,
+  "proxInflam_vs_proxProlif", "prox.-inflam",   "prox.-prolif.",
+  "TRU_vs_proxProlif",        "TRU",          "prox.-prolif.",
+  "TRU_vs_proxInflam",        "TRU",          "prox.-inflam",
+  "StageI_vs_II",         "Stage_I",      "Stage_II",
+  "StageI_vs_III",        "Stage_I",      "Stage_III",
+  "StageI_vs_IV",         "Stage_I",      "Stage_IV",
+  "StageII_vs_III",       "Stage_II",     "Stage_III",
+  "StageII_vs_IV",        "Stage_II",     "Stage_IV",
+  "StageIII_vs_IV",       "Stage_III",    "Stage_IV"
+) %>%
+  # Add sample counts
+  rowwise() %>%
+  mutate(
+    N1 = ifelse(grepl("^Stage", Group1),
+                stage_counts[[Group1]],
+                subtype_counts[[Group1]]),
+    N2 = ifelse(grepl("^Stage", Group2),
+                stage_counts[[Group2]],
+                subtype_counts[[Group2]])
+  ) %>%
+  ungroup()
+
+# Melt into long format for plotting
+long1 <- melt(pairwise_meth[, c("Comparison", "Group1", "N1")], id.vars = "Comparison")
+long2 <- melt(pairwise_meth[, c("Comparison", "Group2", "N2")], id.vars = "Comparison")
+
+long1$Group <- pairwise_meth$Group1
+long1$Count <- pairwise_meth$N1
+
+long2$Group <- pairwise_meth$Group2
+long2$Count <- pairwise_meth$N2
+
+# Combine both
+melted_meth <- rbind(long1[, c("Comparison", "Group", "Count")],
+                     long2[, c("Comparison", "Group", "Count")])
+
+# Define display order on heatmap: first subtypes, then stages
+comparison_order <- c(
+  "proxInflam_vs_proxProlif",
+  "TRU_vs_proxProlif",
+  "TRU_vs_proxInflam",
+  "StageI_vs_II",
+  "StageI_vs_III",
+  "StageI_vs_IV",
+  "StageII_vs_III",
+  "StageII_vs_IV",
+  "StageIII_vs_IV"
+)
+
+# Factor levels for Comparison to enforce order
+melted_meth$Comparison <- factor(melted_meth$Comparison, levels = comparison_order)
+
+# Plot
+ggplot(melted_meth, aes(x = Comparison, y = Group, fill = Count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Count), color = "white", size = 3) +
+  scale_fill_gradient(low = "orchid", high = "#08306b") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Methylation: Samples per Group in Pairwise Comparisons",
+       x = "Comparison", y = "Group") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+After this first section of the analysis, we have produced preprocessed data that will serve as input for the Data Modeling step of the omics cycle.
