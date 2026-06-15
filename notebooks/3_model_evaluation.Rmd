@@ -1,15 +1,44 @@
 ---
-title: "3: TCGA LUAD Test Data Processing & Model Prediction"
+
+title: "LUAD Multi-Omics Classification: Model Evaluation"
 output:
-  html_document:
-    df_print: paged
----
+html_document:
+df_print: paged
+---------------
 
-# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+# Model Evaluation
 
-**Silvia Cambiago\
-Sofiia Hoian\
-Ana Belen Solis Pinson**
+## Project Overview
+
+This notebook evaluates the performance of machine learning models trained to classify LUAD molecular subtypes using integrated transcriptomic and methylation features.
+
+Performance is assessed on an independent test dataset using multiple evaluation metrics.
+
+## Pipeline Position
+
+Step 3 of 4
+
+Data Acquisition → Data Integration → Feature Selection & Modeling → Evaluation → Biological Interpretation
+
+## Evaluation Metrics
+
+* Accuracy
+* Sensitivity
+* Specificity
+* Cohen's Kappa
+* Bootstrap validation
+
+## Outputs
+
+* Confusion matrices
+* Classification metrics
+* Bootstrap performance estimates
+* Comparative model summaries
+
+## Authors
+
+Developed as part of a collaborative academic project at Freie Universität Berlin.
+
 
 # Test Data
 
