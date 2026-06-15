@@ -5,10 +5,6 @@ output: html_notebook
 
 # *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
 
-## Data Science in the Life Sciences S25 - Final Project
-
-### Group 5
-
 **Silvia Cambiago\
 Sofiia Hoian\
 Ana Belen Solis Pinson**
