@@ -4,7 +4,7 @@ This repository contains the final project developed for the Data Science in the
 
 ## Project Goal
 
-To investigate whether integrated RNA-seq and DNA methylation data can be used to classify molecular subtypes of Lung Adenocarcinoma (LUAD).
+To develop a multi-omics machine learning pipeline that integrates RNA-seq and DNA methylation data for the classification of Lung Adenocarcinoma (LUAD) molecular subtypes.
 
 ## Team
 
