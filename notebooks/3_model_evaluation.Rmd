@@ -1,0 +1,888 @@
+---
+title: "3: TCGA LUAD Test Data Processing & Model Prediction"
+output:
+  html_document:
+    df_print: paged
+---
+
+# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+
+## Data Science in the Life Sciences S25 - Final Project
+
+### Group 5
+
+**Silvia Cambiago\
+Sofiia Hoian\
+Ana Belen Solis Pinson**
+
+# Test Data
+
+Our final project focused on working with the TCGA LUAD (Lung Adenocarcinoma) RNA-Seq, Methylation and Clinical data. This R Notebook contains the code corresponding to the Test Data processing and model evaluation by predicting labels on unseen data using the models trained in the data modeling step.
+
+The test data processing includes the following sections:
+
+a.  RNA-Seq & Methylation Test Data Sample Matching
+b.  Test Data Normalization
+c.  Test Data Input Matrix Preparation
+d.  Model Prediction on Test Data
+
+## Setup
+
+Load required libraries.
+
+```{r setup, message=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(recount3)
+library(SummarizedExperiment)
+library(tidyverse)
+library(DESeq2)
+library(org.Hs.eg.db)
+library(caret)
+
+```
+
+## RNA-Seq & Methylation Test Data Sample Matching
+
+The test data will undergo the same preprocessing steps as the training data, to ensure we provide the correct format to our trained models.
+
+```{r test-data-sample-match}
+
+# Load RSE object with split labels
+
+# This dataset was pre-processed by filtering:
+# Sample: Only primary and normal kept
+# Gene: Only protein coding kept
+# Counts: Only genes with 10 counts on at least 10 samples kept
+# And then we carried out a stratified split into 80% train, 20% test
+load("rse_objects/rse_luad_sgc_filtered.RData")
+
+# Load methylation data
+load("met_data_files/LUAD_methylation_SE.rda")
+
+# Filter out MASK_general == TRUE probes, as these are bad quality
+luad_met_filtered <- luad_met[!rowData(luad_met)$MASK_general %in% TRUE, ]
+
+# Extract β-matrix and metadata
+beta_mat  <- assay(luad_met_filtered)
+meta_meth <- as.data.frame(colData(luad_met_filtered))
+
+# Subset to RNA‐seq samples only
+rse_test <- rse_luad_sgc_filtered[, colData(rse_luad_sgc_filtered)$split == "test"]
+rna_ids   <- substr(colData(rse_test)$tcga.cgc_sample_id, 1, 16)
+meth_ids  <- substr(colnames(beta_mat), 1, 16)
+common <- intersect(rna_ids, meth_ids) 
+
+# Select only common samples of type primary tumor
+primary_tumor_met_samples <- meta_meth$sample[meta_meth$sample_type == "Primary Tumor"]
+
+# Intersect RNA-matched methylation samples with primary tumors only
+common_primary <- intersect(common, primary_tumor_met_samples) 
+
+# Align and subset the β‐matrix with only common primary tumor samples
+idx_beta <- match(common_primary, meth_ids)
+beta_sub <- beta_mat[, idx_beta]
+
+# Filter RNA-seq rse_test to keep only matching primary tumor samples
+rna_ids_primary <- match(common_primary, rse_test$tcga.cgc_sample_id)
+rse_test_primary <- rse_test[, rna_ids_primary]
+
+# Create gene annotation vector using luad_met metadata
+gene_annot_vector <- rowData(luad_met_filtered)$gene_HGNC #421433, corresponds to genes mapped to probes
+names(gene_annot_vector) <- rownames(luad_met_filtered)
+
+```
+
+## Test Data Normalisation
+
+Our trained models expect normalised data, so the test data will be normalised in the same way as the training data: the expression values will be normalized using the *DESeq2::vst* function, and the methylation values will be transformed to M values.
+
+```{r test-data-norm, message=FALSE}
+
+# Models require normalized expression counts and methylation M values.
+
+# Methylation data 
+# Convert beta values to M-values
+percentM <- beta_sub * 100
+percentM <- pmin(pmax(percentM, 0.01), 99.99)  # clamp to avoid ±Inf
+Mval <- log2(percentM / (100 - percentM))
+
+# RNA-seq data
+# Build factor in same order as rse_test_primary
+# Subtype
+subtypes_test <- factor(
+  rse_test_primary$expression_subtype[match(common_primary, rse_test_primary$tcga.cgc_sample_id)],
+  levels = c("prox.-inflam", "prox.-prolif.", "TRU"),
+  labels = c("proxInflam", "proxProlif", "TRU") # for readability
+)
+
+# Subtype NA filtering
+keep_subtype <- !is.na(subtypes_test)
+Mval_subtype <- Mval[, keep_subtype] 
+subtypes_test_filtered <- subtypes_test[keep_subtype]
+
+# Subset rse_train_primary to only contain samples with subtype
+short_ids <- stringr::str_sub(rse_test_primary$tcga.cgc_sample_id, 1, 12)
+rse_test_primary$short_id <- short_ids
+keep_samples <- short_ids %in% names(subtypes_test_filtered)
+rse_test_subtyped <- rse_test_primary[, keep_samples]
+
+# RNA-seq data
+raw_counts <- assays(rse_test_subtyped)$raw_counts
+vst_obj <- vst(DESeqDataSetFromMatrix(
+  countData = raw_counts,
+  colData   = colData(rse_test_subtyped),
+  design    = ~ 1
+))
+
+expr_mat <- assay(vst_obj)  # vst-normalized expression
+
+# Assign TCGA sample ids as colnames for expr_mat
+colnames(expr_mat) <- rse_test_subtyped$tcga.cgc_sample_id
+
+```
+
+## Test Data Input Matrix Preparation
+
+The test data will be formatted as the train data for label prediction.
+
+```{r rna-data-processing, message=FALSE}
+
+# RNA-seq data 
+
+# Ensemble to HGNC gene ID mapping
+
+# ensembl_to_symbol function: convert RNA-seq gene Ensemble ids to HGNC, returns a named vector
+
+ensembl_to_symbol <- function(ensembl_ids) {
+  ids_noversion <- sub("\\..*$", "", ensembl_ids)
+  
+  map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = unique(ids_noversion),
+    keytype = "ENSEMBL",
+    columns = "SYMBOL"
+  )
+  
+  map <- map[!is.na(map$SYMBOL) & map$SYMBOL != "", ]
+  map <- map[!duplicated(map$ENSEMBL), ]
+
+  # Named vector: names = Ensembl, values = SYMBOL
+  hgnc_vec <- setNames(map$SYMBOL, map$ENSEMBL)
+
+  # Return in input order
+  return(hgnc_vec[ids_noversion])
+}
+
+# Map ENSEMBLE gene IDs to HGNC and average duplicates
+# Multiple ensemble IDs map to HGNC symbols, so two or more rows can have the same row name (HGNC gene) with different expression values which will be averaged to keep only one row. 
+ensembl_ids <- gsub("\\..*", "", rownames(expr_mat))  # Remove version
+hgnc_names <- ensembl_to_symbol(ensembl_ids)
+gene_symbols <- hgnc_names[ensembl_ids]
+
+# Add gene symbols as a column to a df before assigning as rownames
+expr_df <- as.data.frame(expr_mat)
+expr_df$gene_symbol <- gene_symbols
+
+# Move gene_symbol to the first column
+expr_df <- expr_df[, c(ncol(expr_df), 1:(ncol(expr_df) - 1))]
+
+#Convert to tibble
+expr_df <- as_tibble(expr_df)
+
+# Filter NA gene symbols and aggregate duplicated gene expression values
+expr_df <- expr_df %>%
+  filter(!is.na(gene_symbol) & gene_symbol != "")
+
+# Average duplicates
+expr_avg <- expr_df %>%
+  group_by(gene_symbol) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+# Replace expr_mat with expr_avg to use downstream as matrix again
+expr_mat <- expr_avg %>%
+  column_to_rownames("gene_symbol") %>%
+  as.matrix()
+
+```
+
+```{r meth-data-processing}
+
+# Methylation data
+
+# Mapping CpG probes to gene symbols
+# Collapsing multiple CpG probes that map to one gene. 
+
+# annot_tbl, one probe per row mapped to corresponding gene
+# probes mapping to more than one gene get their own row
+annot_tbl <- tibble(
+  probe = names(gene_annot_vector),
+  gene  = gene_annot_vector
+) %>%
+  separate_rows(gene, sep = ";") %>%
+  filter(!is.na(gene) & gene != "") %>%
+  filter(probe %in% rownames(Mval_subtype))
+
+# mval_long, get gene level M values
+mval_long <- Mval_subtype[annot_tbl$probe, , drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("probe") %>%
+  left_join(annot_tbl, by = "probe") %>%
+  filter(!is.na(gene) & gene != "") %>%
+  pivot_longer(-c(probe, gene), names_to = "sample", values_to = "mval") %>%
+  group_by(gene, sample) %>%
+  summarise(meth = mean(mval, na.rm = TRUE), .groups = "drop")
+
+#methylation values matrix, rows = genes, columns = samples
+meth_mat <- mval_long %>%
+  pivot_wider(names_from = sample, values_from = meth) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+#33123 genes, 40 samples with M values
+
+# Shortening sample names to match expression matrix
+colnames(meth_mat) <- substr(colnames(meth_mat), 1, 16)
+
+```
+
+```{r combined-matrix-processing}
+
+# Intersect genes present in both omics, to create a joint matrix
+common_genes <- intersect(rownames(expr_mat), rownames(meth_mat)) #17670 common genes
+expr_mat_sub <- expr_mat[common_genes, ]
+meth_mat_sub <- meth_mat[common_genes, ]
+
+expr_mat <- expr_mat_sub
+meth_mat <- meth_mat_sub
+
+# Matrix transposing, scaling works when features are cols
+expr_mat <- t(expr_mat)
+meth_mat <- t(meth_mat)
+
+# Keep omics type
+colnames(expr_mat) <- paste0("expr_", colnames(expr_mat))
+colnames(meth_mat) <- paste0("meth_", colnames(meth_mat))
+
+# Combine both matrix and standardize omics values (scale)
+combined_mat <- cbind(expr_mat, meth_mat)
+
+```
+
+The combined matrix containing expresion and methylation values will be scaled using the same mean and standard deviation as for the training data to avoid bias.
+
+```{r test-data-scaling}
+
+# Load means and sds used for scaling train data
+train_means <- readRDS("feature_matrices/train_scaling_means.rds")
+train_sds <- readRDS("feature_matrices/train_scaling_sds.rds")
+
+# Scale matrix using training means and sds
+scaled_combined_test_mat <- sweep(combined_mat, 2, train_means, FUN = "-")
+scaled_combined_test_mat <- sweep(scaled_combined_test_mat, 2, train_sds, FUN = "/")
+
+```
+
+```{r save-scaled-test-matrix}
+
+# Create "feature_matrices" folder if it does not exist
+test_data_dir <- "test_data"
+if (!dir.exists(test_data_dir)) dir.create(test_data_dir)
+
+# Save test scaled combined matrix in test_data dir
+saveRDS(scaled_combined_test_mat, 
+        file = file.path(test_data_dir, "LUAD_test_scaled_expr_meth_mat.rds"))
+
+```
+
+The test input matrices for prediction with our trained models will be created from the combined scaled test matrix in the same way as for the training data.
+
+```{r test-input-matrices}
+
+# We have 3 LUAD binary classification models, 1 per subtype pairwise comparison
+# Each pairwise comparison has an intersection of DEG & DMPs significant genes
+# Build input test data matrices for each model using the intersection genes and also the union for multi-class classifier
+
+inter_dir <- "intersections"
+out_dir <- "feature_matrices"
+log_file <- "feature_matrices/test_input_matrix_log.txt"
+dir.create(out_dir, showWarnings = FALSE)
+
+# Open log connection
+log_con <- file(log_file, open = "wt")
+sink(log_con, type = "output")
+
+# List gene intersection and union files
+inter_files <- list.files(inter_dir, full.names = TRUE)
+
+for (f in inter_files) {
+  comp <- tools::file_path_sans_ext(basename(f)) %>%
+    gsub("^Intersection_", "", .) %>%
+    gsub("^Union_", "union_", .)
+  
+  cat("\n>>> Processing:", comp, "\n")
+
+  genes <- read_csv(f, show_col_types = FALSE)$Gene %>% toupper()
+  
+  # Match columns in combined matrix (columns look like expr_X or meth_X)
+  expr_cols <- paste0("expr_", genes)
+  meth_cols <- paste0("meth_", genes)
+  gene_keep <- intersect(colnames(scaled_combined_test_mat), c(expr_cols, meth_cols))
+  
+  cat(" - Genes in input file:", length(genes), "\n")
+  cat(" - Matched columns in combined matrix:", length(gene_keep), "\n")
+  
+  if (length(gene_keep) < 5) {
+    cat(" !! Too few matched columns for", comp, "\n")
+    next
+  }
+  
+  # Subset feature matrix by genes
+  sub_df <- scaled_combined_test_mat[, gene_keep, drop = FALSE]
+  sub_df <- as.data.frame(sub_df)
+  
+  # Match sample short IDs to subtype mapping
+  sub_df$sample <- rownames(sub_df)
+  sub_df$short_id <- substr(sub_df$sample, 1, 12)
+  sub_df$subtype <- subtypes_test_filtered[sub_df$short_id]
+  
+  # Filter to keep only labeled samples
+  sub_df <- sub_df[!is.na(sub_df$subtype), ]
+  
+  # For intersections: filter to the two subtypes for pairwise comparison
+  if (grepl("^Intersection_", basename(f))) {
+    subtype_pair <- unlist(strsplit(comp, "_vs_"))
+    sub_df <- sub_df[sub_df$subtype %in% subtype_pair, ]
+
+    if (length(unique(sub_df$subtype)) != 2) {
+      cat(" !! Warning: expected 2 subtypes, found:", paste(unique(sub_df$subtype), collapse = ", "), "\n")
+    }
+  }
+  
+  # Clean up: drop short_id, reorder
+  sub_df$short_id <- NULL
+  sub_df <- sub_df[, c(setdiff(colnames(sub_df), c("sample", "subtype")), "sample", "subtype")]
+
+  cat(" - Samples:", nrow(sub_df), "\n")
+  cat(" - Features (expr + meth):", length(gene_keep), "\n")
+  cat(" - Total columns (incl. sample + label):", ncol(sub_df), "\n")
+
+  # Save final matrix
+  write_csv(sub_df, file.path(out_dir, paste0("test_input_matrix_", comp, ".csv")))
+  saveRDS(sub_df, file.path(out_dir, paste0("test_input_matrix_", comp, ".rds")))
+  cat(" - Saved to:", file.path(out_dir, paste0("test_input_matrix_", comp, ".csv")), "\n")
+}
+
+# Close log
+sink()
+close(log_con)
+
+```
+
+## Model Prediction on Test Data
+
+Our trained RF models will be loaded to be applied for label prediction of our test data, and the results evaluated. We carried out predictions for the binary classifiers and for multi-class classifiers. \
+\
+**NOTE:** SVM binary and multi-class predictions and results can be found in the 2_LUAD_DataModeling.Rmd notebook, section 2.6.2. As explained in that section, and after our experience with the random forest model training and predictions, we decided to optimise and automate the SVM training, tuning and prediction for practicality.
+
+### Random Forest Binary Classifiers
+
+#### proxProlif vs proxInflam Subtype Prediction
+
+```{r model-pred-pp-pi}
+
+# Model Prediction on Test data
+
+# proxProlif vs proxInflam binary classification
+# Load input data
+
+# Set the path to proxProlif vs proxInflam test data
+test_matrix_path <- "LUAD_Test_Data/test_input_matrix_proxProlif_vs_proxInflam.csv"
+# True label col, for model evaluation on unseen data
+label_col <- "subtype"
+
+data <- read_csv(test_matrix_path)
+str(data)
+head(data)
+
+# Remove sample column if present
+if ("sample" %in% colnames(data)) {
+  data <- data %>% dplyr::select(-sample)
+}
+
+# Remove rows where subtype is NA
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+# Remove columns that are all NA
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Make sure all features are numeric except label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest
+na_threshold <- 0.2 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+# Load model
+rf_model_pp_pi <- readRDS("LUAD_Random_Forests/rf_model_final_proxProlif_vs_proxInflam.rds")
+
+# Predict labels
+rf_pred_pp_pi_obj <- predict(rf_model_pp_pi, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_pp_pi <- rf_pred_pp_pi_obj$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_pp_pi <- factor(rf_pred_pp_pi, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Model evaluation
+
+# Confusion Matrix using true labels
+confMat_pp_pi <- confusionMatrix(rf_pred_pp_pi, data_imputed[[label_col]])
+# Accuracy: 91.6%, pretty good! 
+# Saving confusion matrix to revisit if needed, metrics are here
+saveRDS(confMat_pp_pi, file = "confMat_pp_pi.rds")
+
+
+# Bootstrapping, check reliability of our results
+# Useful for our small test sample size of 24
+
+# Separating input features and labels from test data
+X_test <- data_imputed %>% dplyr::select(-all_of(label_col))
+y_test <- data_imputed[[label_col]]
+
+# Specify number of bootstrap samples
+n_boot <- 1000
+
+# Store metrics per boostrap in a vector
+accuracies <- numeric(n_boot)
+sensitivities <- numeric(n_boot)
+specificities <- numeric(n_boot)
+kappas <- numeric(n_boot)
+
+# Assign model here to variable name used by for
+rf_model <- rf_model_pp_pi
+
+# Seed for reproducibility
+set.seed(145)  
+
+for (i in 1:n_boot) {
+  # Sample indices with replacement
+  sample_idx <- sample(seq_len(nrow(X_test)), replace = TRUE)
+  
+  # Create bootstrap sample
+  X_boot <- X_test[sample_idx, ]
+  y_boot <- y_test[sample_idx]
+  
+  # Prediction
+  pred_boot_obj <- predict(rf_model, X_boot)
+  pred_boot <- factor(pred_boot_obj$predictions, levels = levels(y_boot))  # force factor with correct levels
+  
+  # Evaluation
+  cm <- confusionMatrix(pred_boot, y_boot)
+  accuracies[i] <- cm$overall["Accuracy"]
+  sensitivities[i] <- cm$byClass["Sensitivity"]
+  specificities[i] <- cm$byClass["Specificity"]
+  kappas[i] <- cm$overall["Kappa"]
+}
+
+# Summary of metrics
+summary(accuracies)
+summary(sensitivities)
+summary(specificities)
+summary(kappas)
+
+# Overall boostrap results from summary observations for proxProlif vs proxInflam RF
+# High accuracy: ~91%
+# High sensitivity for proxInflam (TP for proxInflam) ~93%
+# Decent specificity (TN, pretty good at detecting proxProlif) ~89%
+# Kappa, agreement beyond chance is robust ~81%
+
+# Metric df to save
+bootstrap_results_df_pp_pi <- data.frame(
+  accuracy = accuracies,
+  sensitivity = sensitivities,
+  specificity = specificities,
+  kappa = kappas
+)
+
+# Save metrics df
+write.csv(bootstrap_results_df_pp_pi, "bootstrap_results_proxProlif_vs_proxInflam.csv", row.names = FALSE)
+saveRDS(bootstrap_results_df_pp_pi, file = "bootstrap_results_proxProlif_vs_proxInflam.rds")
+
+```
+
+#### **TRU vs proxInflam Subtype Prediction**
+
+```{r model-pred-tru-pi}
+
+# TRU vs proxInflam binary classification
+# Load input data
+
+# Set the path to TRU vs proxInflam test data
+test_matrix_path <- "LUAD_Test_Data/test_input_matrix_TRU_vs_proxInflam.csv"
+# True label col, for model evaluation on unseen data
+label_col <- "subtype"
+
+data <- read_csv(test_matrix_path)
+str(data)
+head(data)
+
+# Remove sample column if present
+if ("sample" %in% colnames(data)) {
+  data <- data %>% dplyr::select(-sample)
+}
+
+# Remove rows where subtype is NA
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+# Remove columns that are all NA
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Make sure all features are numeric except label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest
+na_threshold <- 0.2 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+# Load model
+rf_model_tru_pi <- readRDS("LUAD_Random_Forests/rf_model_final_TRU_vs_proxInflam.rds")
+
+# Predict labels
+rf_pred_tru_pi_obj <- predict(rf_model_tru_pi, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_tru_pi <- rf_pred_tru_pi_obj$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_tru_pi <- factor(rf_pred_tru_pi, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Model evaluation
+
+# Confusion Matrix using true labels
+confMat_tru_pi <- confusionMatrix(rf_pred_tru_pi, data_imputed[[label_col]])
+# Accuracy: 96.7%
+
+# Saving confusion matrix to revisit if needed, metrics are here
+saveRDS(confMat_tru_pi, file = "LUAD_Data/LUAD_Test_Data/Confusion_Matrices/confMat_tru_pi.rds")
+
+# Bootstrapping, check reliability of our results
+# Useful for our small test sample size of 31
+
+# Separating input features and labels from test data
+X_test <- data_imputed %>% dplyr::select(-all_of(label_col))
+y_test <- data_imputed[[label_col]]
+
+# Specify number of bootstrap samples
+n_boot <- 1000
+
+# Store metrics per boostrap in a vector
+accuracies <- numeric(n_boot)
+sensitivities <- numeric(n_boot)
+specificities <- numeric(n_boot)
+kappas <- numeric(n_boot)
+
+# Assign model here to variable name used by for
+rf_model <- rf_model_tru_pi
+
+# Seed for reproducibility
+set.seed(145)  
+
+for (i in 1:n_boot) {
+  # Sample indices with replacement
+  sample_idx <- sample(seq_len(nrow(X_test)), replace = TRUE)
+  
+  # Create bootstrap sample
+  X_boot <- X_test[sample_idx, ]
+  y_boot <- y_test[sample_idx]
+  
+  # Prediction
+  pred_boot_obj <- predict(rf_model, X_boot)
+  pred_boot <- factor(pred_boot_obj$predictions, levels = levels(y_boot))  # force factor with correct levels
+  
+  # Evaluation
+  cm <- confusionMatrix(pred_boot, y_boot)
+  accuracies[i] <- cm$overall["Accuracy"]
+  sensitivities[i] <- cm$byClass["Sensitivity"]
+  specificities[i] <- cm$byClass["Specificity"]
+  kappas[i] <- cm$overall["Kappa"]
+}
+
+# Summary of metrics
+summary(accuracies)
+summary(sensitivities)
+summary(specificities)
+summary(kappas)
+
+# Overall boostrap results from summary observations for TRU vs proxInflam RF
+# Positive class here is proxInflam
+# High accuracy: ~95%
+# Perfect sensitivity for proxInflam (TP for proxInflam) ~100%
+# High specificity (TN, pretty good at detecting TRU) ~93%
+# Kappa, agreement beyond chance is hight ~93%
+
+# Metric df to save
+bootstrap_results_df_tru_pi <- data.frame(
+  accuracy = accuracies,
+  sensitivity = sensitivities,
+  specificity = specificities,
+  kappa = kappas
+)
+
+# Save metrics df
+write.csv(bootstrap_results_df_tru_pi, "bootstrap_results_TRU_vs_proxInflam.csv", row.names = FALSE)
+saveRDS(bootstrap_results_df_tru_pi, file = "bootstrap_results_TRU_vs_proxInflam.rds")
+
+```
+
+#### TRU vs proxProlif Subtype Prediction
+
+```{r model-pred-tru-pp}
+
+# TRU vs proxProlif binary classification
+# Load input data
+
+# Set the path to TRU vs proxProlif test data
+test_matrix_path <- "LUAD_Test_Data/test_input_matrix_TRU_vs_proxProlif.csv"
+# True label col, for model evaluation on unseen data
+label_col <- "subtype"
+
+data <- read_csv(test_matrix_path)
+str(data)
+head(data)
+
+# Remove sample column if present
+if ("sample" %in% colnames(data)) {
+  data <- data %>% dplyr::select(-sample)
+}
+
+# Remove rows where subtype is NA
+data <- data %>% filter(!is.na(!!sym(label_col)))
+data[[label_col]] <- as.factor(data[[label_col]])
+
+# Remove columns that are all NA
+data <- data[, colSums(is.na(data)) < nrow(data)]
+
+# Make sure all features are numeric except label
+num_cols <- sapply(data, is.numeric)
+num_cols[label_col] <- FALSE
+data <- data[, num_cols | names(data) == label_col]
+
+# Drop columns (genes) with >20% NAs, then impute the rest (only 25 samples)
+na_threshold <- 0.25 * nrow(data)
+data_filtered <- data[, colSums(is.na(data)) < na_threshold]
+
+# Impute remaining NAs with median
+data_imputed <- data_filtered %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=TRUE), .)))
+
+# Load model
+rf_model_tru_pp <- readRDS("LUAD_Random_Forests/rf_model_final_TRU_vs_proxProlif.rds")
+
+# Predict labels
+rf_pred_tru_pp_obj <- predict(rf_model_tru_pp, data_imputed %>% dplyr::select(-all_of(label_col)))
+
+# Extract predictions, named list
+rf_pred_tru_pp <- rf_pred_tru_pp_obj$predictions
+
+# Make sure predicted and true labels are factors with same levels
+rf_pred_tru_pp <- factor(rf_pred_tru_pp, levels = levels(data_imputed[[label_col]]))
+true_labels <- factor(data_imputed[[label_col]], levels = levels(data_imputed[[label_col]]))
+
+# Model evaluation
+
+# Confusion Matrix using true labels
+confMat_tru_pp <- confusionMatrix(rf_pred_tru_pp, data_imputed[[label_col]])
+# Accuracy: 96%, pretty good! 
+# Saving confusion matrix to revisit if needed, metrics are here
+saveRDS(confMat_tru_pp, file = "LUAD_Data/LUAD_Test_Data/Confusion_Matrices/confMat_tru_pp.rds")
+
+
+# Bootstrapping, check reliability of our results
+# Useful for our small test sample size of 25
+
+# Separating input features and labels from test data
+X_test <- data_imputed %>% dplyr::select(-all_of(label_col))
+y_test <- data_imputed[[label_col]]
+
+# Specify number of bootstrap samples
+n_boot <- 1000
+
+# Store metrics per boostrap in a vector
+accuracies <- numeric(n_boot)
+sensitivities <- numeric(n_boot)
+specificities <- numeric(n_boot)
+kappas <- numeric(n_boot)
+
+# Assign model here to variable name used by for
+rf_model <- rf_model_tru_pp
+
+# Seed for reproducibility
+set.seed(145)  
+
+for (i in 1:n_boot) {
+  # Sample indices with replacement
+  sample_idx <- sample(seq_len(nrow(X_test)), replace = TRUE)
+  
+  # Create bootstrap sample
+  X_boot <- X_test[sample_idx, ]
+  y_boot <- y_test[sample_idx]
+  
+  # Prediction
+  pred_boot_obj <- predict(rf_model, X_boot)
+  pred_boot <- factor(pred_boot_obj$predictions, levels = levels(y_boot))  # force factor with correct levels
+  
+  # Evaluation
+  cm <- confusionMatrix(pred_boot, y_boot)
+  accuracies[i] <- cm$overall["Accuracy"]
+  sensitivities[i] <- cm$byClass["Sensitivity"]
+  specificities[i] <- cm$byClass["Specificity"]
+  kappas[i] <- cm$overall["Kappa"]
+}
+
+# Summary of metrics
+summary(accuracies)
+summary(sensitivities)
+summary(specificities)
+summary(kappas)
+
+# Overall boostrap results from summary observations for TRU vs proxProlif RF
+# Positive class here is proxInflam
+# High accuracy: ~96%
+# High sensitivity for proxInflam (TP for proxInflam) ~89%
+# Perfect specificity (TN, great at detecting TRU) ~100%
+# Kappa, agreement beyond chance is hight ~91%
+
+# Metric df to save
+bootstrap_results_df_tru_pp <- data.frame(
+  accuracy = accuracies,
+  sensitivity = sensitivities,
+  specificity = specificities,
+  kappa = kappas
+)
+
+# Save metrics df
+write.csv(bootstrap_results_df_tru_pp, "bootstrap_results_TRU_vs_proxProlif.csv", row.names = FALSE)
+saveRDS(bootstrap_results_df_tru_pp, file = "bootstrap_results_TRU_vs_proxProlif.rds")
+```
+
+### Multi-Class Random Forest Classifier
+
+```{r rf-test-multiclass}
+
+# Load and prepare external test dataset
+
+# Path to the external test feature matrix
+test_matrix_path <- "Test Data/LUAD_feature_matrices/test_input_matrix_union_Subtype_Intersected_Genes.csv"
+
+# Load test data
+test_data <- read_csv(test_matrix_path)
+
+# Remove 'sample' column if present
+if ("sample" %in% colnames(test_data)) test_data <- test_data %>% select(-sample)
+
+# Remove rows with missing subtype labels and convert to factor
+test_data <- test_data %>% filter(!is.na(subtype))
+test_data$subtype <- as.factor(test_data$subtype)
+
+# Align columns and impute missing values
+test_data <- test_data[, colnames(data_imputed)]
+
+# Impute missing values in test data using medians from training data
+for (col in setdiff(names(test_data), "subtype")) {
+  med <- median(data_imputed[[col]], na.rm = TRUE)
+  test_data[[col]][is.na(test_data[[col]])] <- med
+}
+
+# Predict class labels using the final trained model
+test_pred <- predict(rf_model_final, test_data %>% select(-subtype))
+
+# Create confusion matrix comparing predictions vs true labels
+test_conf <- confusionMatrix(test_pred, test_data$subtype)
+
+# Convert confusion matrix to data frame
+test_cm_tbl <- as.data.frame(test_conf$table)
+
+# Plot test confusion matrix
+p_cm_test <- ggplot(test_cm_tbl, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix (Test set)", x = "Predicted", y = "True")
+
+# Save confusion matrix plot
+ggsave(file.path(test_plots_dir, "confusion_matrix_test_union_Subtype_Intersected_Genes.png"),
+       plot = p_cm_test, width = 6, height = 5)
+
+# Save confusion matrix table and object
+write.csv(test_cm_tbl, file.path(test_conf_dir, "confusion_matrix_test_union_Subtype_Intersected_Genes.csv"), row.names = FALSE)
+saveRDS(test_conf, file.path(test_conf_dir, "confusion_matrix_test_union_Subtype_Intersected_Genes.rds"))
+
+# Save raw test predictions
+write.csv(
+  data.frame(True = test_data$subtype, Pred = test_pred),
+  file.path(test_pred_dir, "rf_test_predictions_union_Subtype_Intersected_Genes.csv"),
+  row.names = FALSE
+)
+
+```
+
+Bootstrapping to make up for the small sample size in the test data.
+
+```{r rf-test-muliclass-bootstrap}
+
+n_boot <- 1000
+accs <- numeric(n_boot)
+set.seed(123)
+for (i in 1:n_boot) {
+  idx <- sample(seq_len(nrow(test_data)), replace = TRUE)
+  x_boot <- test_data[idx, ] %>% select(-subtype)
+  y_boot <- test_data$subtype[idx]
+  pred_boot <- predict(rf_model_final, x_boot)
+  accs[i] <- mean(pred_boot == y_boot)
+}
+boot_df <- data.frame(Accuracy=accs)
+write.csv(boot_df, file.path(bootstrap_dir, "bootstrap_results_test_union_Subtype_Intersected_Genes.csv"), row.names = FALSE)
+saveRDS(boot_df, file.path(bootstrap_dir, "bootstrap_results_test_union_Subtype_Intersected_Genes.rds"))
+
+# Histogram plot (Test)
+p_boot_hist <- ggplot(boot_df, aes(x=Accuracy)) +
+  geom_histogram(bins=30, fill="steelblue", color="black") +
+  labs(title="Bootstrap Accuracy Distribution (Test set)", x="Accuracy", y="Count") +
+  theme_minimal()
+
+ggsave(file.path(test_plots_dir, "bootstrap_hist_accuracy_test_union_Subtype_Intersected_Genes.png"), plot=p_boot_hist, width=6, height=4)
+
+# Boxplot (Test)
+boot_long <- boot_df %>% pivot_longer(everything(), names_to="Metric", values_to="Value")
+p_box <- ggplot(boot_long, aes(x=Metric, y=Value, fill=Metric)) +
+  geom_boxplot(alpha=0.7) + theme_minimal() +
+  scale_fill_brewer(palette="Set2") +
+  labs(title="Bootstrap Metrics Boxplot (Test set)")
+
+ggsave(file.path(test_plots_dir, "bootstrap_boxplot_test_union_Subtype_Intersected_Genes.png"), plot=p_box, width=6, height=4)
+
+cat(sprintf("Bootstrap mean accuracy: %.3f, 95%% CI: [%.3f, %.3f]\n",
+            mean(accs), quantile(accs,0.025), quantile(accs,0.975)))
+
+```
+
+In this notebook we have processed our test set, produced a normalised and scaled test feature matrix, used it as input for our trained models and evaluated model accuracy on unseen data.
