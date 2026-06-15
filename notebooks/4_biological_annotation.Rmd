@@ -1,13 +1,26 @@
----
-title: "4: LUAD Annotation"
-output: html_notebook
----
+# Biological Annotation and Interpretation
 
-# *Integrating transcriptomic, epigenomic and clinical data to train a classification model to predict cancer subtype for lung cancer*
+## Project Overview
 
-**Silvia Cambiago\
-Sofiia Hoian\
-Ana Belen Solis Pinson**
+This notebook performs functional annotation and biological interpretation of genes identified through differential analyses and machine learning feature selection.
+
+The goal is to identify biological pathways, molecular processes, and disease associations underlying LUAD subtype classification.
+
+## Methods
+
+- Gene identifier harmonization
+- GO enrichment analysis
+- KEGG pathway enrichment
+- Reactome enrichment
+- Disease Ontology analysis
+- Feature overlap analysis
+
+## Outputs
+
+- Enriched pathways
+- Functional annotations
+- Gene overlap summaries
+- Biological interpretation figures
 
 In the annotation part of the project we want to link machine learning features and differentially regulated genes to biological meaning.
 
